@@ -2,7 +2,8 @@ from logging import getLogger
 from typing import TYPE_CHECKING, List, Tuple, Union
 
 from tiktoken import Encoding
-from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
+from vllm import LLM
 
 if TYPE_CHECKING:
     # solve the circular import
@@ -28,9 +29,10 @@ class Model:
     name = ""
     type = ""
 
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast, Encoding]
+
     def __init__(self, args: "ModelArguments"):
         self.args = args
-        self.tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast, Encoding] = None
 
     def set_ppl_args(self, **extra_model_args):
         r"""Set the configurations for PPL score calculation. This is useful because different datasets may have different requirements for ppl calculation."""

@@ -36,7 +36,7 @@ class Evaluator:
         if self.model_args.vllm:
             from vllm import LLM
 
-            if isinstance(self.model.model, LLM):
+            if isinstance(getattr(self.model, "model"), LLM):
                 self.dataset_args.batch_size = -1
                 logger.info(
                     "Setting batch_size to -1, since vllm can automatically planning the optimal batch and order."
@@ -59,6 +59,7 @@ class Evaluator:
             collate_fn=lambda x: x,
             shuffle=False,
             pin_memory=True,
+            batch_sampler=self.dataset.get_batch_sampler(),
         )
 
         if self.evaluation_args.dry_run:
@@ -77,18 +78,24 @@ class Evaluator:
 
         # use tqdm for non-vllm models
         if self.dataset_args.batch_size != -1:
-            tqdm_kwargs = dict(iterable=dataloader, desc=self.dataset.name, dynamic_ncols=True, unit=" examples")
+
+            stride_scale = self.dataset_args.batch_size
+
+            # use normalization only in get_ppl mode
+            if self.dataset.use_normalization and self.dataset.model_evaluation_method == "get_ppl":
+                stride_scale /= 2
+
+            tqdm_kwargs = dict(
+                iterable=dataloader,
+                desc=self.dataset.name,
+                dynamic_ncols=True,
+                unit=" examples",
+                stride_scale=stride_scale,
+            )
             if self.dataset.model_evaluation_method == "get_ppl":
-                # dataloader is often sacled by batch size and option nums, comparing to evaluation data
-                stride_scale = self.dataset_args.batch_size
-                if self.dataset.use_normalization:
-                    stride_scale /= 2
-                dataloader = dynamic_stride_tqdm(
-                    strides=self.dataset.option_nums, stride_scale=stride_scale, **tqdm_kwargs
-                )
+                dataloader = dynamic_stride_tqdm(strides=self.dataset.option_nums, **tqdm_kwargs)
             else:
-                stride_scale = self.dataset_args.batch_size
-                dataloader = dynamic_stride_tqdm(stride_scale=self.dataset_args.batch_size, total=self.dataset.len(option_num=False), **tqdm_kwargs)
+                dataloader = dynamic_stride_tqdm(total=self.dataset.len(option_num=False), **tqdm_kwargs)
 
         # call model
         raw_predictions = []

@@ -13,6 +13,7 @@ import tqdm as tqdm_lib
 
 from .icl_strategies import ape, global_entropy_ordering_strategy, knn_construct_examples
 from .utils import get_raw_dataset_loader
+from .cache_prefix_sampler import CachePrefixSampler
 
 if typing.TYPE_CHECKING:
     # solve the circular import
@@ -178,7 +179,7 @@ class Dataset(torch.utils.data.Dataset):
         logger.info(self.args)
 
     @property
-    def model_evaluation_method(self) -> Literal['get_ppl', 'get_prob', 'generation', 'user_defined']:
+    def model_evaluation_method(self) -> Literal['get_ppl', 'get_prob', 'generation', 'user_defined']:  # type: ignore
         if not hasattr(self, "args"):
             raise ValueError("The `args` attribute is not found. Please call `__init__` first.")
         if self.evaluation_type == "ranking":
@@ -197,7 +198,7 @@ class Dataset(torch.utils.data.Dataset):
 
     def load_raw_dataset(
         self,
-        dataset_path: str,
+        dataset_path: Optional[str],
         subset_name: Optional[str],
         evaluation_set: str,
         example_set: Optional[str],
@@ -300,7 +301,8 @@ class Dataset(torch.utils.data.Dataset):
         # automatic instruction
         if self.ape is True:
             instrction = ape(
-                self.formatted_example_data, self.formatted_evaluation_dataset, self.model.get_ppl, self.model.api_key
+                self.formatted_example_data, self.formatted_evaluation_dataset, self.model.get_ppl,
+                self.model.args.openai_api_key
             )
             self.instruction = instrction
 
@@ -366,7 +368,7 @@ class Dataset(torch.utils.data.Dataset):
         """
         # it is not recommended to modify instance, in case of multiple calls
         formatted_instance = self.format_instance(instance)
-        loose = "\n" if loose else ""
+        loose = "\n" if loose else ""  # type: ignore
 
         if self.evaluation_type == "ranking" and "target_idx" in formatted_instance:
             if self.args.ranking_with_options:
@@ -448,7 +450,7 @@ class Dataset(torch.utils.data.Dataset):
 
             return source
 
-    def construct_examples(self, instance=None) -> str:
+    def construct_examples(self, instance: Optional[dict] = None) -> str:
         r"""Format one instance with the instruction and demonstration.
 
         Args:
@@ -465,6 +467,7 @@ class Dataset(torch.utils.data.Dataset):
             )
 
         if self.kate is True:
+            assert isinstance(instance, dict), "instance is used by KATE when formating examples."
             if isinstance(instance["source"], list):
                 instance_source = instance["source"][instance["source_idx"]]
             else:
@@ -521,10 +524,11 @@ class Dataset(torch.utils.data.Dataset):
 
         subject_results = {}
         if self.category_column is not None:
+            subjects = map(lambda i: f"{self.name}[{i[self.category_column]}]", self.evaluation_data)
             subject_results = pd.DataFrame({
                 "predictions": predictions,
                 "references": self.references,
-                "subject": map(lambda i: f"{self.name}[{i[self.category_column]}]", self.evaluation_data),
+                "subject": subjects,
             }).groupby("subject").apply(lambda df: _calculate_metric(df["predictions"], df["references"])).to_dict()
 
         metric_results = OrderedDict(**subject_results)
@@ -549,7 +553,7 @@ class Dataset(torch.utils.data.Dataset):
         score_lists: Optional[Dict[str, List[float]]] = None,
         file: Optional[str] = None,
         _to_json: bool = True,
-    ) -> pd.DataFrame:
+    ) -> Union[pd.Series, bool, None]:
         r"""Save the dataset inputs and corresponding model predictions to file. Log intermediate results with `log_predictions(raw_predictions)` and log final results with `log_predictions(raw_predictions, processed_predictions, score_lists)`.
 
         Args:
@@ -589,6 +593,7 @@ class Dataset(torch.utils.data.Dataset):
                 self._lines_iter = zip(
                     range(self.len()), self.evaluation_instances, repeat_iter(self.references, self.args.sample_num)
                 )
+            # append latest intermediate results to the file until line_iter is exhausted
             for idx, source, reference in self._lines_iter:
                 lines = {
                     "index": idx,
@@ -598,7 +603,7 @@ class Dataset(torch.utils.data.Dataset):
                 }
                 if _to_json:
                     with open(file, "a") as f:
-                        json.dump(lines, f, ensure_ascii=False)
+                        json.dump(lines, f, ensure_ascii=False, indent=4)
                         f.write("\n")
                 return lines
             return None
@@ -693,6 +698,18 @@ class Dataset(torch.utils.data.Dataset):
             )
             return None
 
+    def get_batch_sampler(self):
+        r"""Get the batch sampler for the dataset.
+
+        Returns:
+            Optional[Sampler]: The batch sampler.
+        """
+        if hasattr(self, "batch_sampler"):
+            return self.batch_sampler
+        if self.model_evaluation_method == "get_ppl":
+            self.batch_sampler = CachePrefixSampler(self.evaluation_data)
+        return None
+
     def last_score_lists(self) -> Dict[str, List[float]]:
         results = {}
         for metric in self.metrics:
@@ -771,7 +788,7 @@ class DatasetCollection(torch.utils.data.Dataset):
         option_num=True,
         normalization=True,
         strict=True,
-    ) -> Iterator[Union[list, dict]]:
+    ) -> Iterator[Union[list, dict, None]]:
         st = 0
         if obj is None:
             yield from [None] * len(self._datasets)
@@ -804,8 +821,8 @@ class DatasetCollection(torch.utils.data.Dataset):
         score = self._split_by_subset(score_lists, sample_num=False, option_num=False, normalization=False)
 
         if processed_predictions is None:
-            for d, r, p, s in zip(self._datasets, raw, processed, score):
-                results = d.log_predictions(r, p, s, file, True)
+            for d, r, s in zip(self._datasets, raw, score):
+                results = d.log_predictions(r, None, s, file, True)
                 if results is not None:
                     return
         else:
@@ -823,8 +840,13 @@ class DatasetCollection(torch.utils.data.Dataset):
             except Exception as e:
                 logger.debug(f"Failed to log predictions: {e}")
 
-    def post_processing(self, predictions: List[Union[str, float]]):
-        return sum((d.post_processing(p) for d, p in zip(self._datasets, self._split_by_subset(predictions))), [])
+    def post_processing(
+        self, predictions: Union[List[Tuple[str, float]], List[Tuple[float, ...]]]
+    ) -> Union[List[Tuple[str, float]], List[Tuple[float, ...]]]:  # -> Any:
+        results = []
+        for d, p in zip(self._datasets, self._split_by_subset(predictions)):
+            results.extend(d.post_processing(p))
+        return results
 
     def __getitem__(self, idx):
         if idx > self.__len__():
@@ -855,7 +877,8 @@ class DatasetCollection(torch.utils.data.Dataset):
         metric_entries = results[f"{self.name}:{self.subset_names[0]}"].keys()
 
         # append subcategories results if available
-        if self.categorized_subsets and len(self.subset_names) == sum(len(s) for s in self.categorized_subsets.values()):
+        if self.categorized_subsets and len(self.subset_names
+                                            ) == sum(len(s) for s in self.categorized_subsets.values()):
             for cat, cat_subjects in self.categorized_subsets.items():
                 cat_results = [results[f"{self.name}:{subject}"] for subject in cat_subjects]
                 results[f"{self.name}[{cat}]"] = {m: np.mean([r[m] for r in cat_results]) for m in metric_entries}

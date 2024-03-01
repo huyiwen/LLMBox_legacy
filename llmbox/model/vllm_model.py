@@ -1,7 +1,8 @@
 from logging import getLogger
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from .model import Model
 
@@ -20,7 +21,7 @@ logger = getLogger(__name__)
 
 class LabelProcessor:
 
-    def __init__(self, candidate_ids: List[int]) -> List[int]:
+    def __init__(self, candidate_ids: List[int]):
         self.candidate_ids = candidate_ids
 
     def __call__(self, token_ids: List[int], logits_row: torch.Tensor) -> torch.Tensor:
@@ -33,6 +34,9 @@ class LabelProcessor:
 
 
 class vllmModel(Model):
+
+    model: LLM
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
     def __init__(self, args: "ModelArguments"):
         super().__init__(args)

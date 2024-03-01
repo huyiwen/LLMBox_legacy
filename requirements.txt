@@ -11,9 +11,10 @@ coloredlogs
 nltk
 sacrebleu
 rouge_score
-vllm
+vllm>=0.3.2
 flash-attn
 langcodes
 language_data
 anthropic
 google-api-python-client
+yapf==0.40.2

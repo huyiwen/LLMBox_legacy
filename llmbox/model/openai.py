@@ -1,8 +1,10 @@
 import time
 from logging import getLogger
+from typing import List, Tuple, Union
 
 import openai
 import tiktoken
+from openai.error import AuthenticationError, InvalidRequestError, RateLimitError
 
 from ..utils import ModelArguments
 from .enum import OPENAI_CHAT_MODELS, OPENAI_INSTRUCTION_MODELS
@@ -23,7 +25,9 @@ class Openai(Model):
         super().__init__(args)
 
         if openai.__version__ != "0.28.1":
-            logger.warning(f"OpenAI version is {openai.__version__}, not 0.28.1. Please make sure the version is correct.")
+            logger.warning(
+                f"OpenAI version is {openai.__version__}, not 0.28.1. Please make sure the version is correct."
+            )
 
         logger.info(f"Trying to load OpenAI model with api_base='{openai.api_base}'")
         self.api_key = openai.api_key  # the actual api key is used in icl
@@ -66,7 +70,7 @@ class Openai(Model):
         self.generation_kwargs = generation_kwargs
         self.multi_turn = extra_model_args.pop("multi_turn", False)
 
-    def get_ppl(self, batched_inputs):
+    def get_ppl(self, batched_inputs) -> List[Tuple[float, int]]:
         prompt = [src + tgt for src, tgt in batched_inputs]
         results = self.request(prompt, self.ppl_kwargs)
         ppls = []
@@ -77,7 +81,7 @@ class Openai(Model):
             ppls.append((ppl, tgt_end - tgt_start))
         return ppls
 
-    def generation(self, batched_inputs):
+    def generation(self, batched_inputs) -> Union[List[str], List[Tuple[str, ...]]]:
         results = self.request(batched_inputs, self.generation_kwargs, self.multi_turn)
         answers = []
         for result in results:
@@ -117,12 +121,10 @@ class Openai(Model):
                 else:
                     response = openai.Completion.create(model=self.name, prompt=prompt, **openai_kwargs)
                     return response["choices"]
-            except openai.error.RateLimitError:
+            except RateLimitError:
                 logger.warning("Receive openai.error.RateLimitError, retrying...")
                 time.sleep(10)
-            except openai.error.AuthenticationError as e:
-                raise e
-            except openai.error.InvalidRequestError as e:
+            except (AuthenticationError, InvalidRequestError) as e:
                 raise e
             except Exception as e:
                 logger.warning(f"Receive {e.__class__.__name__}: {str(e)}")

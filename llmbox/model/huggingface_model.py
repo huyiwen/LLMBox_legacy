@@ -72,6 +72,9 @@ def load_hf_model(args: ModelArguments) -> Tuple[PreTrainedModel, Union[PreTrain
 
 class HuggingFaceModel(Model):
 
+    model: PreTrainedModel
+    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
+
     def __init__(self, args: ModelArguments):
         super().__init__(args)
         self.args = args
