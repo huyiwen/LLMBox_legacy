@@ -16,6 +16,7 @@ class dynamic_stride_tqdm(tqdm.tqdm):
         unit: str = "it",
         dynamic_ncols: bool = False,
         miniters: Optional[Union[int, float]] = 1,
+        disallow_overflow: bool = True,
         **kwargs
     ):
         """Tqdm progress bar with dynamic strides. Use `strides` to specify the strides for each step and `stride_scale` to scale the strides. For example, if `strides` is `[1, 2, 3]` and `stride_scale` is `2`, then the fianl strides will be `[2, 4, 6]`, which require 12 iterations to stop. Different from `unit_scale` which changes the unit of the progress bar., `stride_scale` only changes the stride of each iteration. `total` is set to the length of `strides` list by default."""
@@ -24,6 +25,8 @@ class dynamic_stride_tqdm(tqdm.tqdm):
         else:
             self.strides = [1] * total
         self.stride_scale = float(stride_scale)
+        self.disallow_overflow = disallow_overflow
+        self._hold = False
         super().__init__(
             iterable=iterable,
             desc=desc,
@@ -55,13 +58,17 @@ class dynamic_stride_tqdm(tqdm.tqdm):
         try:
             for obj in iterable:
                 yield obj
+                if self._hold:
+                    self._hold = False
+                    continue
                 if int(n) >= len(self.strides):
                     # allow overflow of progress bar to avoid out of range error
                     n += 1 * self.stride_scale
                 else:
                     # Update the progress bar with dynamic strides
                     n += 1 * self.stride_scale / self.strides[int(n)]
-                n = min(n, len(self.strides))
+                if self.disallow_overflow:
+                    n = min(n, len(self.strides))
 
                 if n - last_print_n >= self.miniters:
                     cur_t = time()
@@ -73,3 +80,7 @@ class dynamic_stride_tqdm(tqdm.tqdm):
         finally:
             self.n = int(n)
             self.close()
+
+    def hold_tqdm(self):
+        """Hold the progress bar for one iteration."""
+        self._hold = True

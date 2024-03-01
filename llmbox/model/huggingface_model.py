@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import CrossEntropyLoss
@@ -8,19 +8,28 @@ from transformers.models.auto import AutoModelForCausalLM, AutoTokenizer
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
-from ..utils import ModelArguments
+from ..utils.cache_prefix_sampler import SequenceCache
 from .model import Model
+
+if TYPE_CHECKING:
+    from ..utils import ModelArguments
 
 logger = getLogger(__name__)
 
+_Tokenizer = Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
-def load_hf_model(args: ModelArguments) -> Tuple[PreTrainedModel, Union[PreTrainedTokenizer, PreTrainedTokenizerFast]]:
+
+def load_hf_model(args: "ModelArguments",
+                  return_postfix_tokenizer: bool = True) -> Tuple[PreTrainedModel, _Tokenizer, Optional[_Tokenizer]]:
     logger.info(f"Loading {args.model_name_or_path} using Hugging Face Transformers...")
 
     model_kwargs = dict(
         torch_dtype=torch.float16,
         device_map=args.device_map,
     )
+
+    if args.prefix_caching:
+        model_kwargs["is_decoder"] = True
 
     if args.flash_attention:
         model_kwargs["attn_implementation"] = "flash_attention_2"
@@ -33,7 +42,7 @@ def load_hf_model(args: ModelArguments) -> Tuple[PreTrainedModel, Union[PreTrain
                 f"Cannot set `attn_implementation` for {args.model_name_or_path}: {e}. Set `flash_attention` to False."
             )
             args.flash_attention = False
-            model_kwargs.pop("attn_implementation")
+            model_kwargs.pop("attn_implementation", None)
             model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs).eval()
         else:
             raise e
@@ -41,6 +50,19 @@ def load_hf_model(args: ModelArguments) -> Tuple[PreTrainedModel, Union[PreTrain
     tokenizer = AutoTokenizer.from_pretrained(
         args.tokenizer_name_or_path, use_fast=True, padding_side="left", truncation_side="left", add_eos_token=False
     )
+    if return_postfix_tokenizer:
+        postfix_tokenizer = AutoTokenizer.from_pretrained(
+            args.tokenizer_name_or_path,
+            use_fast=True,
+            padding_side="right",
+            truncation_side="right",
+            add_eos_token=False,
+            add_bos_token=False,
+        )
+        if postfix_tokenizer.pad_token is None:
+            postfix_tokenizer.pad_token = postfix_tokenizer.unk_token
+    else:
+        postfix_tokenizer = None
 
     # TODO: [Important]!!! check for each tokenizer
     if tokenizer.pad_token is None:
@@ -67,7 +89,7 @@ def load_hf_model(args: ModelArguments) -> Tuple[PreTrainedModel, Union[PreTrain
 
     tokenizer.model_max_length = max_length
     logger.debug(f"Model: {model}\nTokenizer: {tokenizer}")
-    return model, tokenizer
+    return model, tokenizer, postfix_tokenizer
 
 
 class HuggingFaceModel(Model):
@@ -75,7 +97,7 @@ class HuggingFaceModel(Model):
     model: PreTrainedModel
     tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast]
 
-    def __init__(self, args: ModelArguments):
+    def __init__(self, args: "ModelArguments"):
         super().__init__(args)
         self.args = args
         self.type = args.model_type
@@ -85,7 +107,12 @@ class HuggingFaceModel(Model):
                 " model type, which can be chosen from `base` and `instruction`."
             )
 
-        self.model, self.tokenizer = load_hf_model(args)
+        self.model, self.tokenizer, self.postfix_tokenizer = load_hf_model(args, args.prefix_caching)
+        self.space_token_id = -100
+        if self.postfix_tokenizer is not None:
+            input_ids = self.postfix_tokenizer(" postfix").input_ids
+            if len(input_ids) > 1:
+                self.space_token_id = input_ids[0]
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     @staticmethod
@@ -96,13 +123,156 @@ class HuggingFaceModel(Model):
                 yield token_idx
         yield len(offset_mapping)
 
+    def get_cache(
+        self,
+        batched_inputs: List[str],
+        prefix_cache: Optional[SequenceCache] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[SequenceCache]]:
+        """
+        Return:
+            logits (`torch.Tensor`): Logits of batched inputs. At the same device as `self.device`.
+            input_ids (`torch.Tensor`): A tensor of input_ids of batched inputs. At the same device as `self.device`.
+            input_lengths (`List[int]`): The number of non-padding tokens in each input.
+            caches (`List[SequenceCache]`): A list of caches for each prefix and input pair. At the same device as `self.device`.
+        """
+        batch_size = len(batched_inputs)
+        if prefix_cache is not None:
+            cache_num = prefix_cache.get_seq_num()
+            if cache_num != batch_size and cache_num != 1:
+                raise RuntimeError(
+                    f"The number of sentence in prefix_cache should be one or be equal to the batch size {batch_size}"
+                )
+            _tokenizer = self.postfix_tokenizer
+        else:
+            _tokenizer = self.tokenizer
+
+        # keeps the arguments the same as get_ppl, except for arguments specified at the tokenizer class level
+        batched_encodings = _tokenizer(
+            batched_inputs,
+            padding=True,
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors="pt",
+        )  # type: ignore
+        input_ids = batched_encodings["input_ids"]
+        attention_mask = batched_encodings["attention_mask"]
+        # logger.info(f"Space {self.space_token_id}")
+        if input_ids[:, :1].eq(self.space_token_id).all():
+            input_ids = input_ids[:, 1:]
+            attention_mask = attention_mask[:, 1:]
+
+        # prepare attention_mask and position_ids
+        input_lengths = [len(am.nonzero()) for am in attention_mask]
+        max_input_len = max(input_lengths)
+        # logger.info(f"{batched_inputs} {input_ids} {attention_mask} {input_lengths}")
+        if prefix_cache is not None:
+            max_prefix_len = prefix_cache.get_seq_num()
+            if cache_num == 1 and batch_size > 1:
+                prefix_cache = prefix_cache.expand_seq(batch_size)
+                prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()))
+                prefix_lengths = [prefix_cache.get_seq_length()] * batch_size
+                input_pos = torch.arange(max_prefix_len, max_input_len + max_prefix_len,
+                                         device=self.device).expand(batch_size, -1)
+            else:
+                prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()))
+                prefix_lengths = []
+                input_pos = []
+                for seq_idx in range(batch_size):
+                    prefix_len = prefix_cache.real_seq_length[seq_idx]
+                    prefix_mask[seq_idx, :-prefix_len] = 0
+                    prefix_lengths.append(prefix_len)
+                    input_pos.append(torch.arange(prefix_len, max_input_len + prefix_len))
+                input_pos = torch.stack(input_pos).to(self.device)
+            attention_mask = torch.concatenate([prefix_mask, attention_mask], dim=1)  # type: ignore
+            # prefix_cache = prefix_cache.to(self.device).to_legacy_cache()
+            # prefix_cache = prefix_cache.to_legacy_cache()  # type: ignore
+        else:
+            max_prefix_len = 0
+            prefix_lengths = [0] * batch_size
+            input_pos = None
+
+        # print(input_pos)
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        with torch.no_grad():
+            results = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=input_pos,
+                past_key_values=prefix_cache,
+                use_cache=True,
+            )
+
+            # store the non-padding parts of caches to ensure the correct creation of position_ids when using
+            # these caches in the future
+            caches = results.past_key_values
+            if not isinstance(caches, SequenceCache):
+                caches = SequenceCache.from_legacy_cache(caches)
+            caches = [
+                seq.strip(max_prefix_len - prefix_len, max_input_len - input_len)
+                for seq, prefix_len, input_len in zip(caches.get_seq_iter(), prefix_lengths, input_lengths)
+            ]
+        logits = results.logits.detach()
+        input_ids = input_ids
+        return logits, input_ids, input_lengths, caches
+
+    def get_ppl_with_cache(
+        self,
+        batched_targets: List[str],
+        last_logits: torch.Tensor,
+        prefix_cache: SequenceCache,
+    ) -> List[Tuple[float, int]]:
+        logits, labels, input_lengths, _ = self.get_cache(batched_targets, prefix_cache)
+        # logger.info(f"GetpplC {logits} {labels} {input_lengths}")
+        shift_logits = torch.concat([last_logits.to(logits.device), logits[:, :-1]], dim=-2)
+        labels[labels == self.tokenizer.pad_token_id] = -100
+        # logger.info(f"GetpplC {shift_logits} {labels}")
+        probs = self.loss_fct(shift_logits.view(-1, self.model.config.vocab_size),
+                              labels.view(-1)).view(labels.size(0), -1).cpu()
+
+        ppls = []
+        for prob, tgt_len in zip(probs, input_lengths):
+            ppl = sum(prob.tolist()[:tgt_len])
+            ppls.append((ppl, tgt_len))
+        return ppls
+
     def set_ppl_args(self, **extra_model_args):
         r"""Set the configurations for PPL score calculation. This is useful because different datasets may have different requirements for ppl calculation."""
         self.loss_fct = CrossEntropyLoss(reduction="none")
+        self._ppl_args_set = True
         if len(extra_model_args) > 0:
             logger.warning(f"Unused generation arguments: {extra_model_args}")
 
-    def get_ppl(self, batched_inputs: List[Tuple[str, str]]) -> List[float]:
+    def get_ppl(self, batched_inputs: List[Tuple[str, str]]) -> List[Tuple[float, int]]:
+        if not self._ppl_args_set:
+            logger.warning(f"Please set the get_ppl arguments using `set_ppl_args` before calling `get_ppl`.")
+
+        if self.cacher is not None:
+            transposed_inputs = list(map(list, zip(*batched_inputs)))
+            prefixes, targets = transposed_inputs[:-1], transposed_inputs[-1]
+
+            # if cache is available, get_ppl_with_cache
+            prefix = ["".join(p[i] for p in prefixes) for i in range(len(prefixes[0]))]
+            prefix_cache = self.cacher.get_cache(prefix)
+            if prefix_cache is not None:
+                last_logits, prefix_cache = prefix_cache
+                return self.get_ppl_with_cache(targets, last_logits, prefix_cache)
+
+            # else get the shorted prefix that has not been cached
+            # print(prefix, prefixes)
+            for idx in range(len(prefixes) - 1, -1, -1):
+                cur_prefix = [prefix[i][:len(prefixes[idx][i])] for i in range(len(prefix))]
+                # print("Cur", cur_prefix)
+                prefix_cache = self.cacher.get_cache(cur_prefix)
+                if prefix_cache is not None:
+                    break
+                prefix = cur_prefix
+            logits, _, _, prefix_cache = self.get_cache(prefixes[idx])
+            last_logits = logits[:, -1:, :].contiguous().cpu()
+            for p, l, c in zip(prefix, last_logits, prefix_cache):
+                self.cacher.set_cache(p, l, c)
+            return []
+
         prompt = [src + tgt for src, tgt in batched_inputs]
 
         batched_encodings = self.tokenizer(
@@ -115,6 +285,7 @@ class HuggingFaceModel(Model):
         ).to(self.device)
 
         with torch.no_grad():
+            # logger.info(f"Getppl {prompt} {batched_encodings.input_ids}")
             logits = self.model(
                 input_ids=batched_encodings["input_ids"], attention_mask=batched_encodings["attention_mask"]
             ).logits
@@ -123,6 +294,7 @@ class HuggingFaceModel(Model):
             shift_labels[shift_labels == self.tokenizer.pad_token_id] = -100
             probs = self.loss_fct(shift_logits.view(-1, self.model.config.vocab_size),
                                   shift_labels.view(-1)).view(shift_labels.size(0), -1).cpu()
+        # logger.info(f"Getppl {shift_logits}, {probs}")
 
         ppls = []
         for prob, (src, _), offset, attention_mask in zip(
@@ -131,10 +303,13 @@ class HuggingFaceModel(Model):
             ppl = [None] + prob.tolist()
             offset = [st for st, ed in offset]
             tgt_start = max(
+                # the start index of the last token in source
                 offset.index(len(src)),
-                attention_mask.nonzero()[0][0].item() + 1
-            )  # designed for src!='' and src=''
+                # the second nonzero token (the first nonzero token is " " if source is empty)
+                attention_mask.nonzero()[0][0].item() + 1,
+            )
             tgt_end = len(offset)
+            # logger.info(ppl[tgt_start:])
             ppl = sum(ppl[tgt_start:])
             ppls.append((ppl, tgt_end - tgt_start))
         return ppls
@@ -175,6 +350,8 @@ class HuggingFaceModel(Model):
         generation_kwargs["pad_token_id"] = self.tokenizer.pad_token_id
         generation_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
         self.generation_kwargs = generation_kwargs
+
+        self._generation_args_set = True
         if len(extra_model_args) > 0:
             logger.warning(f"Unused generation arguments: {extra_model_args}")
 
@@ -184,6 +361,10 @@ class HuggingFaceModel(Model):
         Returns:
             List[str]: The list of generation results.
         """
+        if not self._generation_args_set:
+            logger.warning(
+                f"Please set the generation arguments using `set_generation_args` before calling `generation`."
+            )
 
         batched_encodings = self.tokenizer(
             batched_inputs,
@@ -206,6 +387,7 @@ class HuggingFaceModel(Model):
         self._word_labels = []
         self._candidate_ids = extra_model_args.pop("candidate_ids", None)
 
+        self._prob_args_set = True
         if len(extra_model_args) > 0:
             logger.warning(f"Unused generation arguments: {extra_model_args}")
 
@@ -223,6 +405,9 @@ class HuggingFaceModel(Model):
             return self._candidate_ids
 
     def get_prob(self, batched_inputs: List[Tuple[str, int]]) -> List[List[float]]:
+        if not self._prob_args_set:
+            logger.warning(f"Please set the get_prob arguments using `set_prob_args` before calling `get_prob`.")
+
         batched_prompts, batched_option_nums = map(list, zip(*batched_inputs))
         batched_encodings = self.tokenizer(
             batched_prompts,

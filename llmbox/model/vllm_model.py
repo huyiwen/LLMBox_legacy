@@ -59,7 +59,7 @@ class vllmModel(Model):
     def set_ppl_args(self, **extra_model_args):
         self.ppl_kwargs = SamplingParams(max_tokens=1, prompt_logprobs=0)
 
-    def get_ppl(self, batched_inputs):
+    def get_ppl(self, batched_inputs) -> List[Tuple[float, int]]:
         prompt = [src + tgt for src, tgt in batched_inputs]
         batched_encodings = self.tokenizer(
             prompt, truncation=True, return_offsets_mapping=True, return_attention_mask=False

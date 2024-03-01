@@ -11,9 +11,10 @@ import pandas as pd
 import torch
 import tqdm as tqdm_lib
 
-from .icl_strategies import ape, global_entropy_ordering_strategy, knn_construct_examples
+from ..model.huggingface_model import HuggingFaceModel
+from ..utils.cache_prefix_sampler import CachePrefixSampler
+from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
 from .utils import get_raw_dataset_loader
-from .cache_prefix_sampler import CachePrefixSampler
 
 if typing.TYPE_CHECKING:
     # solve the circular import
@@ -145,6 +146,9 @@ class Dataset(torch.utils.data.Dataset):
         logger.debug(self)
 
     def _post_init_arguments(self):
+
+        extra_model_args = copy(self.extra_model_args)
+
         # sample num
         if self.args.sample_num > 1 and self.model_evaluation_method in {"get_ppl", "get_prob"}:
             self.args.sample_num = 1
@@ -168,12 +172,21 @@ class Dataset(torch.utils.data.Dataset):
             )
             self.args.ranking_with_options = False
 
+        # batch sampler
+        if self.model.args.prefix_caching and (
+            self.model_evaluation_method != "get_ppl" or not isinstance(self.model, HuggingFaceModel)
+        ):
+            logger.warning(
+                "Prefix caching is only available for HuggingFaceModel.get_ppl(). Automatically set prefix_caching to False"
+            )
+            self.model.args.prefix_caching = False
+
         if self.model_evaluation_method == "get_ppl":
-            self.model.set_ppl_args(**self.extra_model_args)
+            self.model.set_ppl_args(**extra_model_args)
         elif self.model_evaluation_method == "generation":
-            self.model.set_generation_args(**self.extra_model_args)
+            self.model.set_generation_args(**extra_model_args)
         elif self.model_evaluation_method == "get_prob":
-            self.model.set_prob_args(**self.extra_model_args)
+            self.model.set_prob_args(**extra_model_args)
 
         logger.info(self.model.args)
         logger.info(self.args)
@@ -698,17 +711,13 @@ class Dataset(torch.utils.data.Dataset):
             )
             return None
 
-    def get_batch_sampler(self):
-        r"""Get the batch sampler for the dataset.
-
-        Returns:
-            Optional[Sampler]: The batch sampler.
-        """
-        if hasattr(self, "batch_sampler"):
-            return self.batch_sampler
-        if self.model_evaluation_method == "get_ppl":
-            self.batch_sampler = CachePrefixSampler(self.evaluation_data)
-        return None
+    def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
+        if not hasattr(self, "_batch_sampler"):
+            if self.model.args.prefix_caching:
+                self._batch_sampler = CachePrefixSampler(self, self.option_nums, self.args.batch_size)
+            else:
+                self._batch_sampler = None
+        return self._batch_sampler
 
     def last_score_lists(self) -> Dict[str, List[float]]:
         results = {}
@@ -741,7 +750,7 @@ class Dataset(torch.utils.data.Dataset):
                 length *= 2
         return length
 
-    def update_tqdm(self, tqdm):
+    def update_tqdm(self, tqdm: Union[tqdm_lib.tqdm, typing.Any]):
         # do nothing
         pass
 
@@ -890,7 +899,7 @@ class DatasetCollection(torch.utils.data.Dataset):
 
         return results, score_lists
 
-    def update_tqdm(self, tqdm):
+    def update_tqdm(self, tqdm: Union[tqdm_lib.tqdm, typing.Any]):
         if isinstance(tqdm, tqdm_lib.tqdm):
             tqdm.set_description(self.name + ":" + self.subset_names[self._cur_idx])
 

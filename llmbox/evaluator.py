@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from .dataset import load_dataset
 from .model import load_model
-from .utils import DatasetArguments, EvaluationArguments, ModelArguments, catch_error, dynamic_stride_tqdm
+from .utils import (DatasetArguments, EvaluationArguments, ModelArguments, catch_error, dynamic_stride_tqdm)
 
 logger = getLogger(__name__)
 
@@ -53,13 +53,22 @@ class Evaluator:
 
         Finally, we call the `calculate_metric` to get the metric score of prediction results.
         """
+        real_batch_size = self.dataset_args.batch_size
+        if self.dataset_args.batch_size == -1:
+            # vllm can automatically planning the optimal batch and order
+            real_batch_size = self.dataset.len()
+        batch_sampler = self.dataset.get_batch_sampler()
+        if batch_sampler is not None:
+            # batch_sampler is mutually exclusive with batch_size
+            real_batch_size = 1
+            self.model.set_cacher(batch_sampler)
         dataloader = DataLoader(
             self.dataset,
-            batch_size=self.dataset_args.batch_size if self.dataset_args.batch_size != -1 else self.dataset.len(),
+            batch_size=real_batch_size,
             collate_fn=lambda x: x,
             shuffle=False,
             pin_memory=True,
-            batch_sampler=self.dataset.get_batch_sampler(),
+            batch_sampler=batch_sampler,
         )
 
         if self.evaluation_args.dry_run:
@@ -78,7 +87,6 @@ class Evaluator:
 
         # use tqdm for non-vllm models
         if self.dataset_args.batch_size != -1:
-
             stride_scale = self.dataset_args.batch_size
 
             # use normalization only in get_ppl mode
@@ -100,9 +108,13 @@ class Evaluator:
         # call model
         raw_predictions = []
         for batch in dataloader:
-            raw_predictions.extend(call_model(batch))
-            self.dataset.log_predictions(raw_predictions)
-            self.dataset.update_tqdm(dataloader)
+            batch_results = call_model(batch)
+            raw_predictions.extend(batch_results)
+            if len(batch_results) > 0:
+                self.dataset.log_predictions(raw_predictions)
+                self.dataset.update_tqdm(dataloader)
+            elif isinstance(dataloader, dynamic_stride_tqdm):
+                dataloader.hold_tqdm()
 
         if len(raw_predictions) != self.dataset.len():
             raise RuntimeError(

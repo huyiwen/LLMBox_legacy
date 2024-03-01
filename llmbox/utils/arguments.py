@@ -61,6 +61,10 @@ class ModelArguments:
         default=True,
         help="Whether to use flash attention",
     )
+    prefix_caching: bool = HfArg(
+        default=True,
+        help="Whether to cache prefix in get_ppl mode",
+    )
     openai_api_key: str = HfArg(
         default=None,
         help="The OpenAI API key",

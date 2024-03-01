@@ -1,13 +1,14 @@
 from logging import getLogger
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from tiktoken import Encoding
-from transformers import PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast
+from transformers import (PreTrainedModel, PreTrainedTokenizer, PreTrainedTokenizerFast)
 from vllm import LLM
 
 if TYPE_CHECKING:
     # solve the circular import
     from ..utils import ModelArguments
+    from ..utils.cache_prefix_sampler import Cacher
 
 logger = getLogger(__name__)
 
@@ -29,10 +30,16 @@ class Model:
     name = ""
     type = ""
 
+    model: Union[PreTrainedModel, LLM, None] = None
     tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast, Encoding]
+    cacher: Optional["Cacher"] = None
 
     def __init__(self, args: "ModelArguments"):
         self.args = args
+
+    def set_cacher(self, cacher: "Cacher"):
+        r"""Set the cacher for this model. The cacher is used to cache the generated results for the model."""
+        self.cacher = cacher
 
     def set_ppl_args(self, **extra_model_args):
         r"""Set the configurations for PPL score calculation. This is useful because different datasets may have different requirements for ppl calculation."""
