@@ -110,15 +110,18 @@ class Cacher:
 
 class CachePrefixSampler(Sampler[List[int]], Cacher):
 
-    def __init__(self, data: list, option_nums: list, batch_size: int):
+    def __init__(self, data: List[Tuple[str, str]], option_nums: List[int], batch_size: int):
         self.data = data
         self.option_nums = option_nums
         self.batch_size = batch_size
+        # print(data, option_nums, len(data), len(option_nums))
+        # exit()
 
         # for caching
         self.cached: OrderedDict[int, Tuple[torch.Tensor, SequenceCache]] = OrderedDict()
         self.queued_size = 0
         self.data_idx = None
+        self.cache_idx = 0
 
         # split data into (src,) and (src, tgt)
         self.first_options = []
@@ -146,21 +149,21 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         else:
             last_logits = torch.stack(last_logits)
             caches = SequenceCache.pad_and_stack(caches)
-        # logger.debug(f"Get cache: {sources} -> {last_logits.shape}, {caches}")
+        logger.debug(f"Get cache: {sources} -> {last_logits.shape}, {caches}")
         return last_logits, caches
 
     def set_cache(self, src: str, last_logit: torch.Tensor, cache: SequenceCache):
         if self.data_idx is None:
             raise RuntimeError("Cache can only be set during iteration.")
 
-        largest_idx = self.reverse_src[src]
-        self.cached[largest_idx] = (last_logit, cache)
-        # update data queue
-        self.queued_size = max(largest_idx - self.data_idx + 1, self.queued_size)
-        # logger.debug(f"Set cache: {src}")
+        self.cached[self.reverse_src[src]] = (last_logit, cache)
+        self.queued_size += self.option_nums[self.cache_idx]
+        self.cache_idx += 1
+        logger.debug(f"Set cache: {src}")
 
     def __iter__(self) -> Iterator[List[int]]:
         self.data_idx = 0
+        self.cache_idx = 0
         data_len = len(self.data)
         not_cached = self.first_options
         while self.data_idx < data_len:
@@ -177,11 +180,11 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                         self.cached.pop(idx)
                     else:
                         break
-                # logger.debug(f"Yield with cache: {data_with_cache}")
+                logger.debug(f"Yield with cache: {data_with_cache}")
                 yield data_with_cache
             else:
                 # we need to cache the sources first. update data queue in set_cache
-                # logger.debug(f"Yield to cache: {not_cached[:self.batch_size]}")
+                logger.debug(f"Yield to cache: {not_cached[:self.batch_size]}")
                 yield not_cached[:self.batch_size]
                 not_cached = not_cached[self.batch_size:]
 

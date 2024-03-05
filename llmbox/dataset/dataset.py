@@ -12,6 +12,7 @@ import torch
 import tqdm as tqdm_lib
 
 from ..model.huggingface_model import HuggingFaceModel
+from ..utils import dynamic_stride_tqdm
 from ..utils.cache_prefix_sampler import CachePrefixSampler
 from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
 from .utils import get_raw_dataset_loader
@@ -295,6 +296,9 @@ class Dataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         return self.evaluation_instances[idx]
+
+    def __iter__(self):
+        yield from self.evaluation_instances
 
     @property
     def references(self):
@@ -750,9 +754,14 @@ class Dataset(torch.utils.data.Dataset):
                 length *= 2
         return length
 
-    def update_tqdm(self, tqdm: Union[tqdm_lib.tqdm, typing.Any]):
-        # do nothing
-        pass
+    def update_tqdm(
+        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], desc_postfix: Optional[str] = None, hold: bool = False
+    ):
+        if isinstance(tqdm, dynamic_stride_tqdm):
+            if desc_postfix is not None:
+                tqdm.set_description(self.name + ":" + desc_postfix)
+            if hold:
+                tqdm.hold_tqdm()
 
     def __repr__(self):
         reprs = [f"{p}={getattr(self, p)!r}" for p in self._repr]
@@ -816,6 +825,14 @@ class DatasetCollection(torch.utils.data.Dataset):
                 dlen = d.len(sample_num, option_num, normalization)
                 yield {k: v[st:st + dlen] for k, v in obj.items()}
                 st += dlen
+
+    def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
+        if not hasattr(self, "_batch_sampler"):
+            if self._datasets[0].model.args.prefix_caching:
+                self._batch_sampler = CachePrefixSampler(self, self.option_nums, self.args.batch_size)
+            else:
+                self._batch_sampler = None
+        return self._batch_sampler
 
     def log_predictions(
         self,
@@ -899,9 +916,15 @@ class DatasetCollection(torch.utils.data.Dataset):
 
         return results, score_lists
 
-    def update_tqdm(self, tqdm: Union[tqdm_lib.tqdm, typing.Any]):
-        if isinstance(tqdm, tqdm_lib.tqdm):
-            tqdm.set_description(self.name + ":" + self.subset_names[self._cur_idx])
+    def update_tqdm(
+        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], desc_postfix: Optional[str] = None, hold: bool = False
+    ):
+        if isinstance(tqdm, dynamic_stride_tqdm):
+            if desc_postfix is None:
+                desc_postfix = self.subset_names[self._cur_idx]
+            tqdm.set_description(self.name + ":" + desc_postfix)
+            if hold:
+                tqdm.hold_tqdm()
 
     def __repr__(self):
         reprs = [f"{p}={getattr(self, p)!r}" for p in self._repr]

@@ -114,7 +114,7 @@ class Evaluator:
                 self.dataset.log_predictions(raw_predictions)
                 self.dataset.update_tqdm(dataloader)
             elif isinstance(dataloader, dynamic_stride_tqdm):
-                dataloader.hold_tqdm()
+                self.dataset.update_tqdm(dataloader, desc_postfix="caching...", hold=True)
 
         if len(raw_predictions) != self.dataset.len():
             raise RuntimeError(
