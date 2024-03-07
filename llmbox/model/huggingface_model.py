@@ -127,13 +127,16 @@ class HuggingFaceModel(Model):
         self,
         batched_inputs: List[str],
         prefix_cache: Optional[SequenceCache] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[int], List[SequenceCache]]:
+        return_caches: bool = True,
+    ) -> Union[List[SequenceCache], Tuple[torch.Tensor, torch.Tensor, List[int]]]:
         """
         Return:
-            logits (`torch.Tensor`): Logits of batched inputs. At the same device as `self.device`.
-            input_ids (`torch.Tensor`): A tensor of input_ids of batched inputs. At the same device as `self.device`.
-            input_lengths (`List[int]`): The number of non-padding tokens in each input.
-            caches (`List[SequenceCache]`): A list of caches for each prefix and input pair. At the same device as `self.device`.
+            `return_caches` is True:
+                caches (`List[SequenceCache]`): A list of caches for each prefix and input pair without padding. At the same device as `self.device`.
+            `return_caches` is False:
+                logits (`torch.Tensor`): Logits of batched inputs. At the same device as `self.device`.
+                input_ids (`torch.Tensor`): A tensor of input_ids of batched inputs. At the same device as `self.device`.
+                input_lengths (`List[int]`): The number of non-padding tokens in each input.
         """
         batch_size = len(batched_inputs)
         if prefix_cache is not None:
@@ -183,7 +186,7 @@ class HuggingFaceModel(Model):
                     prefix_lengths.append(prefix_len)
                     input_pos.append(torch.arange(prefix_len, max_input_len + prefix_len))
                 input_pos = torch.stack(input_pos).to(self.device)
-            attention_mask = torch.concatenate([prefix_mask, attention_mask], dim=1)  # type: ignore
+            attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)  # type: ignore
             # prefix_cache = prefix_cache.to(self.device).to_legacy_cache()
             # prefix_cache = prefix_cache.to_legacy_cache()  # type: ignore
         else:
@@ -202,29 +205,30 @@ class HuggingFaceModel(Model):
                 past_key_values=prefix_cache,
                 use_cache=True,
             )
+            logits = results.logits.detach()
 
+        if return_caches:
             # store the non-padding parts of caches to ensure the correct creation of position_ids when using
             # these caches in the future
             caches = results.past_key_values
             if not isinstance(caches, SequenceCache):
                 caches = SequenceCache.from_legacy_cache(caches)
-            caches = [
-                seq.strip(max_prefix_len - prefix_len, max_input_len - input_len)
-                for seq, prefix_len, input_len in zip(caches.get_seq_iter(), prefix_lengths, input_lengths)
-            ]
-        logits = results.logits.detach()
-        input_ids = input_ids
-        return logits, input_ids, input_lengths, caches
+            caches = list(caches.get_seq_iter())
+            for idx, seq_cache in enumerate(caches):
+                seq_cache.remove_paddings(
+                    num_l=max_prefix_len - prefix_lengths[idx],
+                    num_r=max_input_len - input_lengths[idx],
+                )
+                seq_cache.last_logits = [logits[idx:idx + 1, -1:, :].contiguous()]
+            return caches  # only return caches helps prevent the memory leak
+        else:
+            return logits, input_ids, input_lengths
 
-    def get_ppl_with_cache(
-        self,
-        batched_targets: List[str],
-        last_logits: torch.Tensor,
-        prefix_cache: SequenceCache,
-    ) -> List[Tuple[float, int]]:
-        logits, labels, input_lengths, _ = self.get_cache(batched_targets, prefix_cache)
+    def get_ppl_with_cache(self, batched_targets: List[str], prefix_cache: SequenceCache) -> List[Tuple[float, int]]:
+        logits, labels, input_lengths = self.get_cache(batched_targets, prefix_cache, return_caches=False)
         # logger.info(f"GetpplC {logits} {labels} {input_lengths}")
-        shift_logits = torch.concat([last_logits.to(logits.device), logits[:, :-1]], dim=-2)
+        last_logits = torch.cat(prefix_cache.last_logits).to(logits.device)
+        shift_logits = torch.cat([last_logits, logits[:, :-1]], dim=-2)
         labels[labels == self.tokenizer.pad_token_id] = -100
         # logger.info(f"GetpplC {shift_logits} {labels}")
         probs = self.loss_fct(shift_logits.view(-1, self.model.config.vocab_size),
@@ -249,28 +253,28 @@ class HuggingFaceModel(Model):
 
         if self.cacher is not None:
             transposed_inputs = list(map(list, zip(*batched_inputs)))
-            prefixes, targets = transposed_inputs[:-1], transposed_inputs[-1]
+            prefix_groups, targets = transposed_inputs[:-1], transposed_inputs[-1]
 
             # if cache is available, get_ppl_with_cache
-            prefix = ["".join(p[i] for p in prefixes) for i in range(len(prefixes[0]))]
-            prefix_cache = self.cacher.get_cache(prefix)
+            joined_prefixes = ["".join(p[i] for p in prefix_groups) for i in range(len(prefix_groups[0]))]
+            prefix_cache = self.cacher.get_cache(joined_prefixes)
             if prefix_cache is not None:
-                last_logits, prefix_cache = prefix_cache
-                return self.get_ppl_with_cache(targets, last_logits, prefix_cache)
+                return self.get_ppl_with_cache(targets, prefix_cache)
 
             # else get the shorted prefix that has not been cached
             # print(prefix, prefixes)
-            for idx in range(len(prefixes) - 1, -1, -1):
-                cur_prefix = [prefix[i][:len(prefixes[idx][i])] for i in range(len(prefix))]
+            for idx in range(len(prefix_groups) - 1, -1, -1):
+                cur_joined_prefixes = [
+                    joined_prefixes[i][:len(prefix_groups[idx][i])] for i in range(len(joined_prefixes))
+                ]
                 # print("Cur", cur_prefix)
-                prefix_cache = self.cacher.get_cache(cur_prefix)
+                prefix_cache = self.cacher.get_cache(cur_joined_prefixes)
                 if prefix_cache is not None:
                     break
-                prefix = cur_prefix
-            logits, _, _, prefix_cache = self.get_cache(prefixes[idx])
-            last_logits = logits[:, -1:, :].contiguous().cpu()
-            for p, l, c in zip(prefix, last_logits, prefix_cache):
-                self.cacher.set_cache(p, l, c)
+                joined_prefixes = cur_joined_prefixes
+            prefix_cache = self.get_cache(prefix_groups[idx])
+            for p, c in zip(joined_prefixes, prefix_cache):
+                self.cacher.set_cache(p, c)
             return []
 
         prompt = [src + tgt for src, tgt in batched_inputs]

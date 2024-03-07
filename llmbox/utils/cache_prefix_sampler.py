@@ -3,6 +3,7 @@ from logging import getLogger
 from typing import Iterator, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data.sampler import Sampler
 from transformers import DynamicCache
 from typing_extensions import Self
@@ -16,7 +17,12 @@ class SequenceCache(DynamicCache):
     """A cache that supports some sequence level operations."""
 
     def __init__(self) -> None:
-        super().__init__()
+        # keeps cache in a list instead of a stacked tensor because the tensor may on different devices
+        self.key_cache: List[torch.Tensor] = []
+        self.value_cache: List[torch.Tensor] = []
+
+        self.seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
+        self.last_logits: List[torch.Tensor] = []
         self.real_seq_length: List[int] = []
 
     @classmethod
@@ -33,65 +39,70 @@ class SequenceCache(DynamicCache):
     def get_seq_num(self) -> int:
         return len(self.real_seq_length)
 
-    def strip(self, num_l: int = 0, num_r: int = 0) -> "SequenceCache":
+    def remove_paddings(self, num_l: int = 0, num_r: int = 0):
         if num_l + num_r > 0:
-            cache = SequenceCache()
-            cache.real_seq_length = [l - num_l - num_r for l in self.real_seq_length]
-            for key, value in zip(self.key_cache, self.value_cache):
-                cache.key_cache.append(key[..., num_l:-num_r, :])
-                cache.value_cache.append(value[..., num_l:-num_r, :])
-            cache.seen_tokens = self.seen_tokens - num_l - num_r
-            return cache
-        else:
-            return self
+            self.real_seq_length = [l - num_l - num_r for l in self.real_seq_length]
+            for layer_idx in range(len(self.key_cache)):
+                self.key_cache[layer_idx] = self.key_cache[layer_idx][..., num_l:-num_r, :]
+                self.value_cache[layer_idx] = self.value_cache[layer_idx][..., num_l:-num_r, :]
+            self.seen_tokens = self.seen_tokens - num_l - num_r
 
     def get_seq_iter(self) -> Iterator["SequenceCache"]:
         for seq_idx in range(self.get_seq_num()):
             yield self.get_seq_cache(seq_idx)
 
+    def _apply_cache(self, fn) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        applied = [(fn(key), fn(value)) for key, value in zip(self.key_cache, self.value_cache)]
+        key_list, value_list = map(list, zip(*applied))
+        return key_list, value_list
+
     def get_seq_cache(self, seq_idx: int) -> "SequenceCache":
         cache = SequenceCache()
         cache.real_seq_length = [self.real_seq_length[seq_idx]]
-        for layer_idx, (key, value) in enumerate(zip(self.key_cache, self.value_cache)):
-            cache.update(key[seq_idx:seq_idx + 1, ...], value[seq_idx:seq_idx + 1, ...], layer_idx)
+        if len(self.last_logits) > seq_idx:
+            cache.last_logits = [self.last_logits[seq_idx]]
+        cache.key_cache, cache.value_cache = self._apply_cache(lambda x: x[seq_idx:seq_idx + 1, ...])
         return cache
 
-    def expand_seq(self, repeat_times: int) -> "SequenceCache":
-        assert self.get_seq_num() == 1, "SequenceCache can only repeat sequence when it contains only one sequence"
+    # def expand_seq(self, repeat_times: int) -> "SequenceCache":
+    #     assert self.get_seq_num() == 1, "SequenceCache can only repeat sequence when it contains only one sequence"
 
-        cache = SequenceCache()
-        cache.seen_tokens = self.seen_tokens
-        cache.real_seq_length = self.real_seq_length * repeat_times
-        for key, value in enumerate(zip(self.key_cache, self.value_cache)):
-            cache.key_cache.append(key.expand(repeat_times, -1))
-            cache.value_cache.append(value.expand(repeat_times, -1))
-        return cache
+    #     cache = SequenceCache()
+    #     cache.seen_tokens = self.seen_tokens
+    #     cache.real_seq_length = self.real_seq_length * repeat_times
+    #     for key, value in enumerate(zip(self.key_cache, self.value_cache)):
+    #         cache.key_cache.append(key.expand(repeat_times, -1))
+    #         cache.value_cache.append(value.expand(repeat_times, -1))
+    #     return cache
 
     @classmethod
     def pad_and_stack(cls, seq_caches: Sequence["SequenceCache"]) -> Self:
         cache = cls()
-        cache.real_seq_length = [sc.get_seq_length() for sc in seq_caches]
+        for sc in seq_caches:
+            cache.last_logits.extend(sc.last_logits)
+            cache.real_seq_length.extend(sc.real_seq_length)
         max_seq_len = max(cache.real_seq_length)
         max_layer_idx = len(seq_caches[0].key_cache)
-        kv_shape = seq_caches[0].key_cache[1].shape
+        cache.seen_tokens = max_seq_len
+
         for layer_idx in range(max_layer_idx):
             key_list = []
             value_list = []
             for sc in seq_caches:
+                kv_shape = sc.key_cache[0].shape
                 if sc.get_seq_length() < max_seq_len:
                     padding = torch.zeros(
                         kv_shape[:-2] + (max_seq_len - sc.get_seq_length(), kv_shape[-1]),
                         device=sc.key_cache[layer_idx].device,
                         dtype=sc.key_cache[layer_idx].dtype
                     )
-                    key_list.append(torch.concatenate([padding, sc.key_cache[layer_idx]], dim=-2))
-                    value_list.append(torch.concatenate([padding, sc.value_cache[layer_idx]], dim=-2))
+                    key_list.append(torch.cat((padding, sc.key_cache[layer_idx]), dim=-2))
+                    value_list.append(torch.cat((padding, sc.value_cache[layer_idx]), dim=-2))
                 else:
                     key_list.append(sc.key_cache[layer_idx])
                     value_list.append(sc.value_cache[layer_idx])
             cache.key_cache.append(torch.cat(key_list, dim=0))
             cache.value_cache.append(torch.cat(value_list, dim=0))
-        cache.seen_tokens = max_seq_len
         return cache
 
     def __repr__(self) -> str:
@@ -101,10 +112,10 @@ class SequenceCache(DynamicCache):
 class Cacher:
     """A base class that supports caching for a list of sources."""
 
-    def get_cache(self, sources: List[str]) -> Optional[Tuple[torch.Tensor, SequenceCache]]:
+    def get_cache(self, sources: List[str]) -> Optional[SequenceCache]:
         raise NotImplementedError
 
-    def set_cache(self, src: str, last_logit: torch.Tensor, cache: SequenceCache):
+    def set_cache(self, src: str, cache: SequenceCache):
         raise NotImplementedError
 
 
@@ -118,7 +129,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         # exit()
 
         # for caching
-        self.cached: OrderedDict[int, Tuple[torch.Tensor, SequenceCache]] = OrderedDict()
+        self.cached: OrderedDict[int, SequenceCache] = OrderedDict()
         self.queued_size = 0
         self.data_idx = None
         self.cache_idx = 0
@@ -133,7 +144,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 self.first_options.append(idx)
             self.reverse_src[src] = idx
 
-    def get_cache(self, sources: List[str]) -> Optional[Tuple[torch.Tensor, SequenceCache]]:
+    def get_cache(self, sources: List[str]) -> Optional[SequenceCache]:
         """Get cache for a list of sources. Return None if any source is not cached.
 
         Return:
@@ -142,21 +153,17 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         caches = [self.cached.get(self.reverse_src[src]) for src in sources]
         if any(c is None for c in caches):
             return None
-        last_logits, caches = zip(*caches)
-        if len(last_logits) == 1:
-            last_logits = last_logits[0].unsqueeze(0)
-            caches = caches[0]
+        logger.debug(f"Get cache: {sources} -> {caches}")
+        if len(caches) == 1:
+            return caches[0]
         else:
-            last_logits = torch.stack(last_logits)
-            caches = SequenceCache.pad_and_stack(caches)
-        logger.debug(f"Get cache: {sources} -> {last_logits.shape}, {caches}")
-        return last_logits, caches
+            return SequenceCache.pad_and_stack(caches)
 
-    def set_cache(self, src: str, last_logit: torch.Tensor, cache: SequenceCache):
+    def set_cache(self, src: str, cache: SequenceCache):
         if self.data_idx is None:
             raise RuntimeError("Cache can only be set during iteration.")
 
-        self.cached[self.reverse_src[src]] = (last_logit, cache)
+        self.cached[self.reverse_src[src]] = cache
         self.queued_size += self.option_nums[self.cache_idx]
         self.cache_idx += 1
         logger.debug(f"Set cache: {src}")
@@ -177,7 +184,8 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 # pop data that is no longer used to save CUDA memory
                 for idx in list(self.cached.keys()):
                     if idx < data_with_cache[0]:
-                        self.cached.pop(idx)
+                        _c = self.cached.pop(idx)
+                        del _c
                     else:
                         break
                 logger.debug(f"Yield with cache: {data_with_cache}")

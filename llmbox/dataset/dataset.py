@@ -9,7 +9,6 @@ from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
-import tqdm as tqdm_lib
 
 from ..model.huggingface_model import HuggingFaceModel
 from ..utils import dynamic_stride_tqdm
