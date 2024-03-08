@@ -29,11 +29,11 @@ class SequenceCache(DynamicCache):
     @classmethod
     def from_legacy_cache(cls, past_key_values: Optional[_LegacyCache] = None) -> "SequenceCache":
         """Converts a cache in the legacy cache format into an equivalent `DynamicCache`."""
-        cache = cls()
+        cache = SequenceCache()
         if past_key_values is not None:
-            for layer_idx in range(len(past_key_values)):
-                key_states, value_states = past_key_values[layer_idx]
-                cache.update(key_states.detach(), value_states.detach(), layer_idx)
+            for key_states, value_states in past_key_values:
+                cache.key_cache.append(key_states.detach())
+                cache.value_cache.append(value_states.detach())
             cache.real_seq_length = [past_key_values[0][0].shape[2]] * past_key_values[0][0].shape[0]
         return cache
 
@@ -48,33 +48,33 @@ class SequenceCache(DynamicCache):
                 self.value_cache[layer_idx] = self.value_cache[layer_idx][..., num_l:-num_r, :]
             self.seen_tokens = self.seen_tokens - num_l - num_r
 
-    def get_seq_iter(self) -> Iterator["SequenceCache"]:
+    def split_by_seq(self) -> List["SequenceCache"]:
+        results = []
         for seq_idx in range(self.get_seq_num()):
-            yield self.get_seq_cache(seq_idx)
+            cache = SequenceCache()
+            cache.real_seq_length = [self.real_seq_length[seq_idx]]
+            if len(self.last_logits) > seq_idx:
+                cache.last_logits = [self.last_logits[seq_idx]]
+            cache.key_cache, cache.value_cache = self._apply_cache(lambda x: x[seq_idx:seq_idx + 1, ...].clone())
+            results.append(cache)
+        return results
 
     def _apply_cache(self, fn) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         applied = [(fn(key), fn(value)) for key, value in zip(self.key_cache, self.value_cache)]
         key_list, value_list = map(list, zip(*applied))
         return key_list, value_list
 
-    def get_seq_cache(self, seq_idx: int) -> "SequenceCache":
+    def expand_seq(self, repeat_times: int) -> "SequenceCache":
+        assert self.get_seq_num() == 1, "SequenceCache can only repeat sequence when it contains only one sequence"
+
         cache = SequenceCache()
-        cache.real_seq_length = [self.real_seq_length[seq_idx]]
-        if len(self.last_logits) > seq_idx:
-            cache.last_logits = [self.last_logits[seq_idx]]
-        cache.key_cache, cache.value_cache = self._apply_cache(lambda x: x[seq_idx:seq_idx + 1, ...])
+        cache.seen_tokens = self.seen_tokens
+        cache.last_logits = self.last_logits * repeat_times
+        cache.real_seq_length = self.real_seq_length * repeat_times
+        for key, value in zip(self.key_cache, self.value_cache):
+            cache.key_cache.append(key.expand(repeat_times, -1, -1, -1))
+            cache.value_cache.append(value.expand(repeat_times, -1, -1, -1))
         return cache
-
-    # def expand_seq(self, repeat_times: int) -> "SequenceCache":
-    #     assert self.get_seq_num() == 1, "SequenceCache can only repeat sequence when it contains only one sequence"
-
-    #     cache = SequenceCache()
-    #     cache.seen_tokens = self.seen_tokens
-    #     cache.real_seq_length = self.real_seq_length * repeat_times
-    #     for key, value in enumerate(zip(self.key_cache, self.value_cache)):
-    #         cache.key_cache.append(key.expand(repeat_times, -1))
-    #         cache.value_cache.append(value.expand(repeat_times, -1))
-    #     return cache
 
     @classmethod
     def pad_and_stack(cls, seq_caches: Sequence["SequenceCache"]) -> "SequenceCache":
@@ -126,7 +126,7 @@ class Cacher:
 class CachePrefixSampler(Sampler[List[int]], Cacher):
     """A sampler that facilitates key-value caching for a list of text segments."""
 
-    def __init__(self, data: Sequence[Tuple[str, ...]], batch_size: int):
+    def __init__(self, data: Sequence[Tuple[str, ...]], batch_size: int, cache_prefix_level: Optional[int] = None):
         self.data = data
         self.batch_size = batch_size
         self.data_idx = None
@@ -136,65 +136,23 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
         # split data into (src,) and (src, tgt)
         self.total_prefix_num = len(self.data[0]) - 1
+        if cache_prefix_level is None:
+            self.cache_prefix_level = self.total_prefix_num
+        elif cache_prefix_level < 0:
+            self.cache_prefix_level = self.total_prefix_num + cache_prefix_level
+        else:
+            self.cache_prefix_level = cache_prefix_level
         self.joined_data = [[] for _ in range(self.total_prefix_num)]
-        self.postfix_nums = [[] for _ in range(self.total_prefix_num)]
-        self.cache_range = defaultdict(lambda: [-1, -1])
+
+        self.grouped_prefixes = [[] for _ in range(self.total_prefix_num)]
         """A mapping from `source` text to its corresponded largest index in `self.data`"""
 
         for s_idx, (*src, _) in enumerate(self.data):
             for p_idx in range(self.total_prefix_num):
                 joined_src = "".join(src[:p_idx + 1])
                 self.joined_data[p_idx].append(joined_src)
-                last_s = self.cache_range[joined_src][1] if joined_src in self.cache_range else None
-                if last_s is None or joined_src != self.joined_data[p_idx][last_s]:
-                    self.postfix_nums[p_idx].append(1)
-                    self.cache_range[joined_src][0] = s_idx  # start
-                else:
-                    self.postfix_nums[p_idx][-1] += 1
-                self.cache_range[joined_src][1] = s_idx + 1  # end
-
-        # src=2 tgt
-        # 0  1   2
-        # 0  1   3
-        # 0  1   4
-        # 0  5   6
-        # 0  5   7
-        # 0  5   8
-        # 1  9  10
-        # 1  9  11
-        # 1  9  12
-        # 1 13  14
-        # 1 13  15
-        # 1 13  16
-        # uniques: [2, 4]
-        # postfix_nums: [[6, 6], [3, 3, 3, 3]]
-        # cache_range: {'0': [0, 5], '01': [0, 2], '05': [3, 5], '1': [6, 11], '19': [6, 8], '1,13': [9, 11]}
-
-        # sample (b=3)  yield      cached     queue     cache
-        # 0
-        # 1          -> [0, 6]      [2, 0]     [12, 0]   set
-
-        # 0  1
-        # 0  5
-        # 1  9       -> [0, 3, 6]   [2, 3]     [12, 9]   get & set
-
-        # 0  1  2
-        # 0  1  3
-        # 0  1  4    -> [0, 1, 2]   [2, 3]     [9, 6]    get
-
-        # 0  5  6
-        # 0  5  7
-        # 0  5  8    -> [3, 4, 5]   [2, 3]     [6, 3]    get
-
-        # 1  9 10
-        # 1  9 11
-        # 1  9 12    -> [6, 7, 8]   [2, 3]     [3, 0]    get
-
-        # 1 13       -> [9]         [2, 4]     [3, 3]    get & set
-
-        # 1 13 14
-        # 1 13 15
-        # 1 13 16    -> [9, 10, 11] [0, 0]      get
+                if s_idx == 0 or joined_src != self.joined_data[p_idx][s_idx - 1]:
+                    self.grouped_prefixes[p_idx].append(s_idx)
 
     def get_cache(self, sources: List[str]) -> Tuple[Optional[SequenceCache], int]:
         """Get cache for a list of sources. Return None if any source is not cached.
@@ -204,122 +162,42 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
             prefix_num (`int`): The number of prefixes that are matched in the cache.
         """
         caches = []
-        prefix_num = -1
+
         # logger.warning(f"{list(self.cache_trie.items())}")
-        for src in sources:
-            results = list(self.cache_trie.prefix(src))
-            # logger.warning(f"Get cache: {pformat(src)} -> {len(results)}")
-            # check all sources have the same prefix number
-            if prefix_num != -1 and len(results) != prefix_num:
-                raise RuntimeError(f"Inconsistent prefix number {len(results)} != {prefix_num}\n{src}")
-            prefix_num = len(results)
-
-            if prefix_num > 0:
-                trie_idx = int(results[-1][0])
-                caches.append(self.cache_data[trie_idx])
-            else:
+        last_idx = None
+        repeated_times = 1
+        batch_size = len(sources)
+        for p, src in enumerate(sources):
+            prefixes = list(self.cache_trie.prefix(src))
+            if len(prefixes) == 0:
                 return None, 0
+            trie_idx = int(prefixes[-1][0])
+            if trie_idx != last_idx or p == batch_size - 1:
+                caches.append(self.cache_data[trie_idx].expand_seq(repeated_times))
+                repeated_times = 1
+            else:
+                repeated_times += 1
 
-        if prefix_num is None:
-            raise RuntimeError("No prefix number")
-        # logger.warning(f"Get cache: {sources}, {prefix_num}")
-        return SequenceCache.pad_and_stack(caches), prefix_num
+            last_idx = trie_idx
 
-    def set_cache(self, src: str, cache: SequenceCache, prefix_num: int):
-        if self.data_idx is None:
-            raise RuntimeError("Cache can only be set during iteration.")
-
-        trie_idx = self.cache_trie.insert(src)
-        # logger.warning(f"{trie_idx}, {src}: {self.cache_data}")
-        if trie_idx > len(self.cache_data):
-            self.cache_data.extend([None] * (trie_idx - len(self.cache_data) + 1))
-            self.cache_data.append(cache)
-        elif trie_idx == len(self.cache_data):
-            self.cache_data.append(cache)
-        else:
-            self.cache_data[trie_idx] = cache
-        # logger.warning(
-        #     f"Set cache: {pformat(src)}, {prefix_num}\n{self.postfix_nums}, {trie_idx}, {self.cache_idx}\n{list(self.cache_trie.items())}"
-        # )
-
-        self.queued_size[prefix_num] += self.postfix_nums[prefix_num][self.cache_idx[prefix_num]]
-        self.cache_idx[prefix_num] += 1
-        logger.debug(f"Set cache: {src}")
+        return SequenceCache.pad_and_stack(caches), len(prefixes)
 
     # @profile_every()
-    def _test_iter(self):
-        # fetch a btach from data queue
-        assert self.data_idx is not None, "Cache can only be set during iteration."
+    def set_cache(self, src: str, cache: SequenceCache, prefix_num: int):
+        trie_idx = self.cache_trie.insert(src)
+        self.cache_data.append(cache)
 
-        # max_spot = min(*self.queued_size, self.batch_size)
-        if 0 not in self.queued_size:
-            to_yield, with_cache = self.fetch_to_cache(self.data_idx + 1, True)
-            if with_cache:
-                max_spot = len(to_yield)
-                for idx in range(self.total_prefix_num):
-                    self.queued_size[idx] -= max_spot
-                self.data_idx += max_spot
-                # logger.warning(f"Yield with cache: {to_yield}")
-
-            yield to_yield
-        else:
-            to_yield, _ = self.fetch_to_cache(self.data_idx + 1, False)
-            # logger.warning(f"Yield to cache: {to_yield}")
-            yield to_yield
-
-        # pop data that is no longer used to save CUDA memory
-        for src, idx in self.cache_trie.items():
-            _, ed = self.cache_range[src]
-            if ed <= to_yield[0]:
-                self.cache_trie.remove(src)
-                self.cache_data[idx] = None
-
-    def fetch_to_cache(self, data_idx: int, yield_with_cache: bool) -> Tuple[List[int], bool]:
-        to_cache = []
-        with_cache = []
-        last_prefix = None
-        cached_idx = len(list(self.cache_trie.prefix(self.joined_data[self.total_prefix_num - 1][data_idx])))
-        if yield_with_cache:
-            need_cache_idx = self.total_prefix_num - 1
-        else:
-            need_cache_idx = cached_idx
-        # print(yield_with_cache, need_cache_idx)
-
-        while len(to_cache) < self.batch_size and data_idx < len(self.data):
-
-            joined_prefix = self.joined_data[need_cache_idx][data_idx]
-            if joined_prefix != last_prefix and len(list(self.cache_trie.prefix(joined_prefix))) < need_cache_idx + 1:
-                if yield_with_cache:
-                    if len(with_cache) > 0:
-                        return with_cache, True
-                    else:
-                        need_cache_idx = cached_idx
-                    yield_with_cache = False
-                to_cache.append(data_idx)
-
-            elif yield_with_cache:
-                with_cache.append(data_idx)
-                if yield_with_cache and len(with_cache) == self.batch_size:
-                    return with_cache, True
-
-            data_idx += 1
-            last_prefix = joined_prefix
-        return to_cache, False
+    def batched(self, iterable):
+        for i in range(0, len(iterable), self.batch_size):
+            yield iterable[i:i + self.batch_size]
 
     def __iter__(self) -> Iterator[List[int]]:
-        self.data_idx = 0
-        data_len = len(self.data)
-
         self.cache_trie = Trie()
         self.cache_data: List[SequenceCache] = []
-        self.queued_size = [0] * self.total_prefix_num
-        self.cache_idx = [0] * self.total_prefix_num
 
-        while self.data_idx < data_len:
-            yield from self._test_iter()
-
-        # clear cache
-        self.data_idx = None
+        for p_idx in range(self.cache_prefix_level):
+            yield from self.batched(self.grouped_prefixes[p_idx])
+        yield from self.batched(range(len(self.data)))
 
     def __repr__(self) -> str:
         return f"CachePrefixSampler(batch_size={self.batch_size})"

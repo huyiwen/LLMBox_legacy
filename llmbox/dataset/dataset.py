@@ -13,7 +13,8 @@ import torch
 from ..model.huggingface_model import HuggingFaceModel
 from ..utils import dynamic_stride_tqdm
 from ..utils.cache_prefix_sampler import CachePrefixSampler
-from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
+from .icl_strategies import (ape, global_entropy_ordering_strategy,
+                             knn_construct_examples)
 from .utils import get_raw_dataset_loader
 
 if typing.TYPE_CHECKING:
@@ -726,7 +727,7 @@ class Dataset(torch.utils.data.Dataset):
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if self.model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size)
+                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size, -1)
             else:
                 self._batch_sampler = None
         return self._batch_sampler
@@ -837,7 +838,7 @@ class DatasetCollection(torch.utils.data.Dataset):
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if self._datasets[0].model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size)
+                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size, -1)
             else:
                 self._batch_sampler = None
         return self._batch_sampler
