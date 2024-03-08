@@ -262,6 +262,9 @@ class HuggingFaceModel(Model):
             # if cache is available, get_ppl_with_cache
             all_prefix = ["".join(pg[i] for pg in prefix_groups) for i in range(batch_num)]
             prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
+            # logger.warning(
+            #     f"get ppl with cache {prefix_cache} {cached_num} {prefix_cache is not None and cached_num == len(transposed_inputs) - 1}"
+            # )
             # logger.warning(f"get_ppl inputs: {transposed_inputs}\n{cached_num} {len(transposed_inputs) - 1}")
             if prefix_cache is not None and cached_num == len(transposed_inputs) - 1:
                 return self.get_ppl_with_cache(targets, prefix_cache)

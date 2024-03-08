@@ -136,6 +136,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
         # split data into (src,) and (src, tgt)
         self.total_prefix_num = len(self.data[0]) - 1
+        self.joined_data = [[] for _ in range(self.total_prefix_num)]
         self.postfix_nums = [[] for _ in range(self.total_prefix_num)]
         self.cache_range = defaultdict(lambda: [-1, -1])
         """A mapping from `source` text to its corresponded largest index in `self.data`"""
@@ -143,8 +144,9 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         for s_idx, (*src, _) in enumerate(self.data):
             for p_idx in range(self.total_prefix_num):
                 joined_src = "".join(src[:p_idx + 1])
-                last_s = self.data[self.cache_range[joined_src][1]] if joined_src in self.cache_range else None
-                if last_s is None or joined_src != "".join(last_s[:p_idx + 1]):
+                self.joined_data[p_idx].append(joined_src)
+                last_s = self.cache_range[joined_src][1] if joined_src in self.cache_range else None
+                if last_s is None or joined_src != self.joined_data[p_idx][last_s]:
                     self.postfix_nums[p_idx].append(1)
                     self.cache_range[joined_src][0] = s_idx  # start
                 else:
@@ -209,8 +211,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
             # logger.warning(f"Get cache: {pformat(src)} -> {len(results)}")
             # check all sources have the same prefix number
             if prefix_num != -1 and len(results) != prefix_num:
-
-                raise RuntimeError(f"Inconsistent prefix number {len(results)} != {prefix_num}")
+                raise RuntimeError(f"Inconsistent prefix number {len(results)} != {prefix_num}\n{src}")
             prefix_num = len(results)
 
             if prefix_num > 0:
@@ -221,14 +222,12 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
         if prefix_num is None:
             raise RuntimeError("No prefix number")
+        # logger.warning(f"Get cache: {sources}, {prefix_num}")
         return SequenceCache.pad_and_stack(caches), prefix_num
 
     def set_cache(self, src: str, cache: SequenceCache, prefix_num: int):
         if self.data_idx is None:
             raise RuntimeError("Cache can only be set during iteration.")
-
-        # if src not in self.reverse_src:
-        #     logger.warning(f"Cache not set: {src}")
 
         trie_idx = self.cache_trie.insert(src)
         # logger.warning(f"{trie_idx}, {src}: {self.cache_data}")
@@ -252,18 +251,20 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         # fetch a btach from data queue
         assert self.data_idx is not None, "Cache can only be set during iteration."
 
-        max_spot = min(*self.queued_size, self.batch_size)
-        if max_spot > 0:
-            to_yield = list(range(self.data_idx, self.data_idx + max_spot))
-            for idx in range(self.total_prefix_num):
-                self.queued_size[idx] -= max_spot
-            self.data_idx += max_spot
+        # max_spot = min(*self.queued_size, self.batch_size)
+        if 0 not in self.queued_size:
+            to_yield, with_cache = self.fetch_to_cache(self.data_idx + 1, True)
+            if with_cache:
+                max_spot = len(to_yield)
+                for idx in range(self.total_prefix_num):
+                    self.queued_size[idx] -= max_spot
+                self.data_idx += max_spot
+                # logger.warning(f"Yield with cache: {to_yield}")
 
-            # logger.warning(f"Yield with cache: {data_with_cache}")
             yield to_yield
         else:
-            need_cache_idx = self.queued_size.index(0)
-            to_yield = self.fetch_to_cache(need_cache_idx, self.data_idx + 1)
+            to_yield, _ = self.fetch_to_cache(self.data_idx + 1, False)
+            # logger.warning(f"Yield to cache: {to_yield}")
             yield to_yield
 
         # pop data that is no longer used to save CUDA memory
@@ -273,14 +274,37 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 self.cache_trie.remove(src)
                 self.cache_data[idx] = None
 
-    def fetch_to_cache(self, need_cache_idx: int, data_idx: int) -> List[int]:
-        results = []
-        while len(results) < self.batch_size and data_idx < len(self.data):
-            results.append(data_idx)
-            joined_prefix = "".join(self.data[data_idx][:need_cache_idx + 1])
-            data_idx = self.cache_range[joined_prefix][1]
-        # logger.warning(f"Yield to cache: {results} {need_cache_idx}, {data_idx}")
-        return results
+    def fetch_to_cache(self, data_idx: int, yield_with_cache: bool) -> Tuple[List[int], bool]:
+        to_cache = []
+        with_cache = []
+        last_prefix = None
+        cached_idx = len(list(self.cache_trie.prefix(self.joined_data[self.total_prefix_num - 1][data_idx])))
+        if yield_with_cache:
+            need_cache_idx = self.total_prefix_num - 1
+        else:
+            need_cache_idx = cached_idx
+        # print(yield_with_cache, need_cache_idx)
+
+        while len(to_cache) < self.batch_size and data_idx < len(self.data):
+
+            joined_prefix = self.joined_data[need_cache_idx][data_idx]
+            if joined_prefix != last_prefix and len(list(self.cache_trie.prefix(joined_prefix))) < need_cache_idx + 1:
+                if yield_with_cache:
+                    if len(with_cache) > 0:
+                        return with_cache, True
+                    else:
+                        need_cache_idx = cached_idx
+                    yield_with_cache = False
+                to_cache.append(data_idx)
+
+            elif yield_with_cache:
+                with_cache.append(data_idx)
+                if yield_with_cache and len(with_cache) == self.batch_size:
+                    return with_cache, True
+
+            data_idx += 1
+            last_prefix = joined_prefix
+        return to_cache, False
 
     def __iter__(self) -> Iterator[List[int]]:
         self.data_idx = 0
