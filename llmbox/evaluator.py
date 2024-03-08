@@ -69,6 +69,8 @@ class Evaluator:
             shuffle=False,
             pin_memory=True,
             batch_sampler=batch_sampler,
+            # num_workers=10,
+            # prefetch_factor=2,
         )
 
         if self.evaluation_args.dry_run:

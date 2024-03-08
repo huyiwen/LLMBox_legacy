@@ -45,7 +45,7 @@ class Model:
         r"""Set the configurations for PPL score calculation. This is useful because different datasets may have different requirements for ppl calculation."""
         raise NotImplementedError(f"{self.name} model must implement the `set_ppl_args` function.")
 
-    def get_ppl(self, batched_inputs: List[Tuple[str, str]]) -> List[Tuple[float, int]]:
+    def get_ppl(self, batched_inputs: List[Tuple[str, ...]]) -> List[Tuple[float, int]]:
         r"""Compute the PPL score of the option given the context for this batch.
 
         Args:

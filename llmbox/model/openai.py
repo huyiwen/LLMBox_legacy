@@ -4,7 +4,7 @@ from typing import List, Tuple, Union
 
 import openai
 import tiktoken
-from openai.error import AuthenticationError, InvalidRequestError, RateLimitError
+from openai.error import (AuthenticationError, InvalidRequestError, RateLimitError)
 
 from ..utils import ModelArguments
 from .enum import OPENAI_CHAT_MODELS, OPENAI_INSTRUCTION_MODELS
@@ -70,8 +70,8 @@ class Openai(Model):
         self.generation_kwargs = generation_kwargs
         self.multi_turn = extra_model_args.pop("multi_turn", False)
 
-    def get_ppl(self, batched_inputs) -> List[Tuple[float, int]]:
-        prompt = [src + tgt for src, tgt in batched_inputs]
+    def get_ppl(self, batched_inputs: List[Tuple[str, ...]]) -> List[Tuple[float, int]]:
+        prompt = ["".join(p) for p in batched_inputs]
         results = self.request(prompt, self.ppl_kwargs)
         ppls = []
         for result, (src, _) in zip(results, batched_inputs):
@@ -81,7 +81,7 @@ class Openai(Model):
             ppls.append((ppl, tgt_end - tgt_start))
         return ppls
 
-    def generation(self, batched_inputs) -> Union[List[str], List[Tuple[str, ...]]]:
+    def generation(self, batched_inputs: List[str]) -> Union[List[str], List[Tuple[str, ...]]]:
         results = self.request(batched_inputs, self.generation_kwargs, self.multi_turn)
         answers = []
         for result in results:

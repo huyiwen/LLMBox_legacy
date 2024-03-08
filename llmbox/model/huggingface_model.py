@@ -1,7 +1,9 @@
 from logging import getLogger
+from pprint import pformat
 from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
+from pytorch_memlab import LineProfiler, profile, profile_every
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.auto import AutoModelForCausalLM, AutoTokenizer
@@ -123,6 +125,7 @@ class HuggingFaceModel(Model):
                 yield token_idx
         yield len(offset_mapping)
 
+    # @profile_every(enable=False)
     def get_cache(
         self,
         batched_inputs: List[str],
@@ -247,34 +250,32 @@ class HuggingFaceModel(Model):
         if len(extra_model_args) > 0:
             logger.warning(f"Unused generation arguments: {extra_model_args}")
 
-    def get_ppl(self, batched_inputs: List[Tuple[str, str]]) -> List[Tuple[float, int]]:
+    def get_ppl(self, batched_inputs: List[Tuple[str, ...]]) -> List[Tuple[float, int]]:
         if not self._ppl_args_set:
             logger.warning(f"Please set the get_ppl arguments using `set_ppl_args` before calling `get_ppl`.")
 
         if self.cacher is not None:
             transposed_inputs = list(map(list, zip(*batched_inputs)))
             prefix_groups, targets = transposed_inputs[:-1], transposed_inputs[-1]
+            batch_num = len(prefix_groups[0])
 
             # if cache is available, get_ppl_with_cache
-            joined_prefixes = ["".join(p[i] for p in prefix_groups) for i in range(len(prefix_groups[0]))]
-            prefix_cache = self.cacher.get_cache(joined_prefixes)
-            if prefix_cache is not None:
+            all_prefix = ["".join(pg[i] for pg in prefix_groups) for i in range(batch_num)]
+            prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
+            # logger.warning(f"get_ppl inputs: {transposed_inputs}\n{cached_num} {len(transposed_inputs) - 1}")
+            if prefix_cache is not None and cached_num == len(transposed_inputs) - 1:
                 return self.get_ppl_with_cache(targets, prefix_cache)
 
-            # else get the shorted prefix that has not been cached
-            # print(prefix, prefixes)
-            for idx in range(len(prefix_groups) - 1, -1, -1):
-                cur_joined_prefixes = [
-                    joined_prefixes[i][:len(prefix_groups[idx][i])] for i in range(len(joined_prefixes))
-                ]
-                # print("Cur", cur_prefix)
-                prefix_cache = self.cacher.get_cache(cur_joined_prefixes)
-                if prefix_cache is not None:
-                    break
-                joined_prefixes = cur_joined_prefixes
-            prefix_cache = self.get_cache(prefix_groups[idx])
-            for p, c in zip(joined_prefixes, prefix_cache):
-                self.cacher.set_cache(p, c)
+            # pass the input without prefix text to the model
+            concat_cached_prefix = ["".join(pg[i] for pg in prefix_groups[:cached_num + 1]) for i in range(batch_num)]
+            # logger.warning(
+            #     f"{pformat(all_prefix)}\n{pformat(prefix_groups[cached_num])}\n{pformat(concat_cached_prefix)}"
+            # )
+            prefix_cache = self.get_cache(prefix_groups[cached_num], prefix_cache)
+            # prefix_cache = self.get_cache(prefix_groups[idx])
+
+            for p, c in zip(concat_cached_prefix, prefix_cache):
+                self.cacher.set_cache(p, c, cached_num)
             return []
 
         prompt = [src + tgt for src, tgt in batched_inputs]

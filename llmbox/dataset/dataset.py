@@ -326,9 +326,14 @@ class Dataset(torch.utils.data.Dataset):
         self.option_nums = []
         if self.model_evaluation_method == "get_ppl":
             for formatted_instance in self.formatted_evaluation_data:
-                instance_with_examples = self.format_instruction_and_examples(formatted_instance)
+                instance_with_examples = self.format_instruction_and_examples(
+                    formatted_instance, split_prefix=self.model.args.prefix_caching
+                )
                 if "options" in formatted_instance:
-                    options = [(instance_with_examples, option) for option in formatted_instance["options"]]
+                    if self.model.args.prefix_caching:
+                        options = [(*instance_with_examples, option) for option in formatted_instance["options"]]
+                    else:
+                        options = [(instance_with_examples, option) for option in formatted_instance["options"]]
                     self.evaluation_instances.extend(options)
                     self.option_nums.append(len(options))
                 else:
@@ -432,7 +437,7 @@ class Dataset(torch.utils.data.Dataset):
         """
         raise NotImplementedError(f"{self.name} dataset must implement the `format_instance` function.")
 
-    def format_instruction_and_examples(self, instance) -> Union[str, List[str]]:
+    def format_instruction_and_examples(self, instance, split_prefix: bool = False) -> Union[str, List[str]]:
         r"""Format one instance with the instruction and demonstration.
 
         Args:
@@ -460,11 +465,13 @@ class Dataset(torch.utils.data.Dataset):
 
             return sources
         else:
-            source = self.examples + self.args.instance_format.format(source=instance["source"], target="")
-            if self.model.type == "instruction":
-                source = self.instruction + "\n\n" + source
-
-            return source
+            instruction = self.instruction + "\n\n" if self.model.type == "instruction" else ""
+            source = self.args.instance_format.format(source=instance["source"], target="")
+            results = [instruction, self.examples, source]
+            if split_prefix:  # to support prefix_caching for get_ppl
+                return [p for p in results if len(p) > 0]
+            else:
+                return "".join(results)
 
     def construct_examples(self, instance: Optional[dict] = None) -> str:
         r"""Format one instance with the instruction and demonstration.
@@ -657,7 +664,9 @@ class Dataset(torch.utils.data.Dataset):
 
                 return zip(*wrapper())
 
-            source_text, target_text = zip(*self.evaluation_instances)
+            *source_texts, target_text = zip(*self.evaluation_instances)
+            batch_size = len(target_text)
+            source_text = ["".join(group[i] for group in source_texts) for i in range(batch_size)]
             if self.use_normalization:
                 source_text, target_text, raw_predictions = source_text[::2], target_text[::2], raw_predictions[::2]
             index, references, transposed_score_lists, option_nums = repeat_by_option(
@@ -684,7 +693,7 @@ class Dataset(torch.utils.data.Dataset):
                     lines.to_json(file, orient="records", indent=4, force_ascii=False)
                 return lines
             except Exception as e:
-                lines = {k: len(v) for k, v in lines.items()}
+                lines = {k: len(list(v)) for k, v in lines.items()}
                 logger.warning(f"Failed to log_predictions: {e}\n{lines}")
                 return None
 
@@ -717,7 +726,7 @@ class Dataset(torch.utils.data.Dataset):
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if self.model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.option_nums, self.args.batch_size)
+                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size)
             else:
                 self._batch_sampler = None
         return self._batch_sampler
@@ -828,7 +837,7 @@ class DatasetCollection(torch.utils.data.Dataset):
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if self._datasets[0].model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.option_nums, self.args.batch_size)
+                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size)
             else:
                 self._batch_sampler = None
         return self._batch_sampler
