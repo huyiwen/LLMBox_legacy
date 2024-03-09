@@ -726,7 +726,7 @@ class Dataset(torch.utils.data.Dataset):
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if self.model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size)
+                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size, cache_batch_size=self.args.batch_size // 4)
             else:
                 self._batch_sampler = None
         return self._batch_sampler
@@ -837,7 +837,7 @@ class DatasetCollection(torch.utils.data.Dataset):
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
             if self._datasets[0].model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size)
+                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size, cache_batch_size=self.args.batch_size // 4)
             else:
                 self._batch_sampler = None
         return self._batch_sampler

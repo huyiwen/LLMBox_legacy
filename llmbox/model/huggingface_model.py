@@ -166,21 +166,21 @@ class HuggingFaceModel(Model):
         if input_ids[:, :1].eq(self.space_token_id).all():
             input_ids = input_ids[:, 1:]
             attention_mask = attention_mask[:, 1:]
-
-        # prepare attention_mask and position_ids
         input_lengths = [len(am.nonzero()) for am in attention_mask]
         max_input_len = max(input_lengths)
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+
         # logger.info(f"{batched_inputs} {input_ids} {attention_mask} {input_lengths}")
         if prefix_cache is not None:
             max_prefix_len = prefix_cache.get_seq_num()
+            prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()), device=self.device)
             if cache_num == 1 and batch_size > 1:
                 prefix_cache = prefix_cache.expand_seq(batch_size)
-                prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()))
                 prefix_lengths = [prefix_cache.get_seq_length()] * batch_size
                 input_pos = torch.arange(max_prefix_len, max_input_len + max_prefix_len,
                                          device=self.device).expand(batch_size, -1)
             else:
-                prefix_mask = torch.ones((batch_size, prefix_cache.get_seq_length()))
                 prefix_lengths = []
                 input_pos = []
                 for seq_idx in range(batch_size):
@@ -190,16 +190,12 @@ class HuggingFaceModel(Model):
                     input_pos.append(torch.arange(prefix_len, max_input_len + prefix_len))
                 input_pos = torch.stack(input_pos).to(self.device)
             attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)  # type: ignore
-            # prefix_cache = prefix_cache.to(self.device).to_legacy_cache()
-            # prefix_cache = prefix_cache.to_legacy_cache()  # type: ignore
+            prefix_cache = prefix_cache.to_legacy_cache()  # type: ignore
         else:
             max_prefix_len = 0
             prefix_lengths = [0] * batch_size
             input_pos = None
 
-        # print(input_pos)
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
         with torch.no_grad():
             results = self.model(
                 input_ids=input_ids,
@@ -213,17 +209,14 @@ class HuggingFaceModel(Model):
         if return_caches:
             # store the non-padding parts of caches to ensure the correct creation of position_ids when using
             # these caches in the future
-            caches = results.past_key_values
-            if not isinstance(caches, SequenceCache):
-                caches = SequenceCache.from_legacy_cache(caches)
-            caches = list(caches.get_seq_iter())
+            caches = SequenceCache.from_legacy_cache(results.past_key_values).split_by_seq()
             for idx, seq_cache in enumerate(caches):
                 seq_cache.remove_paddings(
                     num_l=max_prefix_len - prefix_lengths[idx],
                     num_r=max_input_len - input_lengths[idx],
                 )
-                seq_cache.last_logits = [logits[idx:idx + 1, -1:, :].contiguous()]
-            return caches  # only return caches helps prevent the memory leak
+                seq_cache.last_logits = [logits[idx:idx + 1, -1:, :].clone()]
+            return caches
         else:
             return logits, input_ids, input_lengths
 
