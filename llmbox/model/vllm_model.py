@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from ..utils import ModelArguments
 
 try:
-    from vllm import LLM, SamplingParams
+    from vllm import LLM, EngineArgs, SamplingParams
 except ModuleNotFoundError:
     LLM = None
     EngineArgs = None
@@ -49,11 +49,14 @@ class vllmModel(Model):
             llm_kwargs["enable_prefix_caching"] = True
         if hasattr(EngineArgs, "max_logprobs"):
             llm_kwargs["max_logprobs"] = 20
+        llm_kwargs = {}
+        if hasattr(EngineArgs, "enable_prefix_caching"):
+            llm_kwargs["enable_prefix_caching"] = args.prefix_caching
         self.model = LLM(
             model=args.model_name_or_path,
             tokenizer=args.tokenizer_name_or_path,
             tensor_parallel_size=torch.cuda.device_count(),
-            **llm_kwargs
+            **llm_kwargs,
         )
         self.tokenizer = self.model.get_tokenizer()
         self.tokenizer.truncation_side = "left"

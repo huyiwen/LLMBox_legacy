@@ -35,7 +35,13 @@ def load_model(args: "ModelArguments") -> "Model":
 
                 from .vllm_model import vllmModel
 
-                return vllmModel(args)
+                if vllmModel.model is not None:
+                    return vllmModel(args)
+                else:
+                    args.vllm = False
+                    logger.warning(
+                        "Please install vllm by `pip install vllm` to use vllm model. Or you can use huggingface model by `--vllm False`."
+                    )
             except ValueError as e:
                 if "are not supported for now" in str(e):
                     args.vllm = False
