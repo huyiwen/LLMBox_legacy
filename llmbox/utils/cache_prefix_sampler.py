@@ -287,6 +287,17 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 self.cache_trie.remove(src)
                 self.cache_data[idx] = None
 
+    def dynamic_batch_size(self, total_length: int, yield_length: int) -> bool:
+        avg_length = total_length // yield_length
+        if 0 <= avg_length <= 1:
+            return yield_length >= self.batch_size * 2
+        elif 1 < avg_length <= 2:
+            return yield_length >= self.batch_size
+        elif 2 < avg_length <= 4:
+            return yield_length >= self.batch_size // 2
+        else:
+            return yield_length >= self.batch_size // 4
+
     def fetch_to_cache(self, data_idx: int, yield_with_cache: bool) -> Tuple[List[int], bool]:
         to_cache = []
         with_cache = []
@@ -322,7 +333,7 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 with_cache.append(data_idx)
                 total_length += len(joined_prefix)
                 # logger.warning(f"Add: {len(joined_prefix)}")
-                if len(with_cache) <= self.batch_size:
+                if self.dynamic_batch_size(total_length, len(with_cache)):
                     # logger.warning(f"Yield with cache 2: {with_cache}")
                     return with_cache, True
 
