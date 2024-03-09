@@ -263,9 +263,9 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
         assert self.data_idx is not None, "Cache can only be set during iteration."
 
         # max_spot = min(*self.queued_size, self.batch_size)
-        print(self.queued_size)
-        if self.data[self.data_idx][1].endswith("asteroid belt?\nAnswer:"):
-            print(">>>>", self.data_idx)
+        # print(self.queued_size)
+        # if self.data[self.data_idx][1].endswith("asteroid belt?\nAnswer:"):
+        #     print(">>>>", self.data_idx)
         if 0 not in self.queued_size:
             to_yield, with_cache = self.fetch_to_cache(self.data_idx, True)
             if with_cache:
@@ -287,22 +287,10 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
                 self.cache_trie.remove(src)
                 self.cache_data[idx] = None
 
-    def dynamic_batch_size(self, total_length: int, yield_length: int) -> bool:
-        avg_length = total_length // yield_length
-        if 0 <= avg_length <= 1:
-            return yield_length >= self.batch_size * 2
-        elif 1 < avg_length <= 2:
-            return yield_length >= self.batch_size
-        elif 2 < avg_length <= 4:
-            return yield_length >= self.batch_size // 2
-        else:
-            return yield_length >= self.batch_size // 4
-
     def fetch_to_cache(self, data_idx: int, yield_with_cache: bool) -> Tuple[List[int], bool]:
         to_cache = []
         with_cache = []
         last_prefix = None
-        total_length = 0
         cached_idx = len(list(self.cache_trie.prefix(self.joined_data[self.total_prefix_num - 1][data_idx])))
         # cached_idx = min(cached_idx, self.total_prefix_num - 1)
         if yield_with_cache:
@@ -331,9 +319,8 @@ class CachePrefixSampler(Sampler[List[int]], Cacher):
 
             elif yield_with_cache and cache_num == self.total_prefix_num:
                 with_cache.append(data_idx)
-                total_length += len(joined_prefix)
-                # logger.warning(f"Add: {len(joined_prefix)}")
-                if self.dynamic_batch_size(total_length, len(with_cache)):
+                logger.warning(f"Add: {len(joined_prefix)}")
+                if len(with_cache) == self.batch_size:
                     # logger.warning(f"Yield with cache 2: {with_cache}")
                     return with_cache, True
 

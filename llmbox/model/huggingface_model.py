@@ -131,6 +131,7 @@ class HuggingFaceModel(Model):
         batched_inputs: List[str],
         prefix_cache: Optional[SequenceCache] = None,
         return_caches: bool = True,
+        save_last_logits: bool = False,
     ) -> Union[List[SequenceCache], Tuple[torch.Tensor, torch.Tensor, List[int]]]:
         """
         Return:
@@ -215,7 +216,8 @@ class HuggingFaceModel(Model):
                     num_l=max_prefix_len - prefix_lengths[idx],
                     num_r=max_input_len - input_lengths[idx],
                 )
-                seq_cache.last_logits = [logits[idx:idx + 1, -1:, :].clone()]
+                if save_last_logits:
+                    seq_cache.last_logits = [logits[idx:idx + 1, -1:, :].clone()]
             return caches
         else:
             return logits, input_ids, input_lengths
@@ -267,7 +269,7 @@ class HuggingFaceModel(Model):
             # logger.warning(
             #     f"{pformat(all_prefix)}\n{pformat(prefix_groups[cached_num])}\n{pformat(concat_cached_prefix)}"
             # )
-            prefix_cache = self.get_cache(prefix_groups[cached_num], prefix_cache)
+            prefix_cache = self.get_cache(prefix_groups[cached_num], prefix_cache, save_last_logits=cached_num == len(transposed_inputs) - 2)
             # prefix_cache = self.get_cache(prefix_groups[idx])
 
             for p, c in zip(concat_cached_prefix, prefix_cache):

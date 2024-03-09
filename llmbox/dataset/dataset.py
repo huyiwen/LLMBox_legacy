@@ -763,12 +763,10 @@ class Dataset(torch.utils.data.Dataset):
         return length
 
     def update_tqdm(
-        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], desc_postfix: Optional[str] = None, hold: bool = False
+        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], batch_size: int
     ):
         if isinstance(tqdm, dynamic_stride_tqdm):
-            if desc_postfix is not None:
-                tqdm.set_description(self.name + ":" + desc_postfix)
-            if hold:
+            if batch_size == 0:
                 tqdm.hold_tqdm()
 
     def __repr__(self):
@@ -925,14 +923,13 @@ class DatasetCollection(torch.utils.data.Dataset):
         return results, score_lists
 
     def update_tqdm(
-        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], desc_postfix: Optional[str] = None, hold: bool = False
+        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], batch_size: int
     ):
         if isinstance(tqdm, dynamic_stride_tqdm):
-            if desc_postfix is None:
-                desc_postfix = self.subset_names[self._cur_idx]
-            tqdm.set_description(self.name + ":" + desc_postfix)
-            if hold:
+            if batch_size == 0:
                 tqdm.hold_tqdm()
+            else:
+                tqdm.set_description(self.name + ":" + self.subset_names[self._cur_idx])
 
     def __repr__(self):
         reprs = [f"{p}={getattr(self, p)!r}" for p in self._repr]

@@ -99,7 +99,7 @@ class Evaluator:
 
         # use tqdm for non-vllm models
         if self.dataset_args.batch_size != -1:
-            stride_scale = self.dataset_args.batch_size
+            stride_scale = 1
 
             # use normalization only in get_ppl mode
             if self.dataset.use_normalization and self.dataset.model_evaluation_method == "get_ppl":
@@ -124,9 +124,7 @@ class Evaluator:
             raw_predictions.extend(batch_results)
             if len(batch_results) > 0:
                 self.dataset.log_predictions(raw_predictions)
-                self.dataset.update_tqdm(dataloader)
-            elif isinstance(dataloader, dynamic_stride_tqdm):
-                self.dataset.update_tqdm(dataloader, desc_postfix="caching...", hold=True)
+            self.dataset.update_tqdm(dataloader, len(batch_results))
 
         if len(raw_predictions) != self.dataset.len():
             raise RuntimeError(

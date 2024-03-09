@@ -63,10 +63,10 @@ class dynamic_stride_tqdm(tqdm.tqdm):
                     continue
                 if int(n) >= len(self.strides):
                     # allow overflow of progress bar to avoid out of range error
-                    n += 1 * self.stride_scale
+                    n += 1 * self.stride_scale * len(obj)
                 else:
                     # Update the progress bar with dynamic strides
-                    n += 1 * self.stride_scale / self.strides[int(n)]
+                    n += 1 * self.stride_scale  * len(obj) / self.strides[int(n)]
                 if self.disallow_overflow:
                     n = min(n, len(self.strides))
 
