@@ -69,19 +69,7 @@ class Evaluator:
             shuffle=False,
             pin_memory=True,
             batch_sampler=batch_sampler,
-            # num_workers=10,
-            # prefetch_factor=2,
         )
-
-        x = list(self.dataset.__iter__())
-        y = [self.dataset[i] for i in range(len(self.dataset))]
-        for i in range(len(x)):
-            if x[i] != y[i]:
-                print(i)
-                print(x[i])
-                print(y[i])
-                print("===")
-                assert False
 
         if self.evaluation_args.dry_run:
             self.model.get_ppl = lambda x: [(0, 1)] * len(x)

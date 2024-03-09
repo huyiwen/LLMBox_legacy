@@ -1,5 +1,5 @@
 from logging import getLogger
-from pprint import pformat
+from pprint import pformat, pprint
 from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -224,11 +224,9 @@ class HuggingFaceModel(Model):
 
     def get_ppl_with_cache(self, batched_targets: List[str], prefix_cache: SequenceCache) -> List[Tuple[float, int]]:
         logits, labels, input_lengths = self.get_cache(batched_targets, prefix_cache, return_caches=False)
-        # logger.info(f"GetpplC {logits} {labels} {input_lengths}")
         last_logits = torch.cat(prefix_cache.last_logits).to(logits.device)
         shift_logits = torch.cat([last_logits, logits[:, :-1]], dim=-2)
         labels[labels == self.tokenizer.pad_token_id] = -100
-        # logger.info(f"GetpplC {shift_logits} {labels}")
         probs = self.loss_fct(shift_logits.view(-1, self.model.config.vocab_size),
                               labels.view(-1)).view(labels.size(0), -1).cpu()
 
@@ -250,27 +248,20 @@ class HuggingFaceModel(Model):
             logger.warning(f"Please set the get_ppl arguments using `set_ppl_args` before calling `get_ppl`.")
 
         if self.cacher is not None:
-            transposed_inputs = list(map(list, zip(*batched_inputs)))
-            prefix_groups, targets = transposed_inputs[:-1], transposed_inputs[-1]
+            *prefix_groups, targets = list(map(list, zip(*batched_inputs)))
             batch_num = len(prefix_groups[0])
 
             # if cache is available, get_ppl_with_cache
             all_prefix = ["".join(pg[i] for pg in prefix_groups) for i in range(batch_num)]
             prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
-            # logger.warning(
-            #     f"get ppl with cache {prefix_cache} {cached_num} {prefix_cache is not None and cached_num == len(transposed_inputs) - 1}"
-            # )
-            # logger.warning(f"get_ppl inputs: {transposed_inputs}\n{cached_num} {len(transposed_inputs) - 1}")
-            if prefix_cache is not None and cached_num == len(transposed_inputs) - 1:
+            if prefix_cache is not None and cached_num == len(prefix_groups):
                 return self.get_ppl_with_cache(targets, prefix_cache)
 
             # pass the input without prefix text to the model
             concat_cached_prefix = ["".join(pg[i] for pg in prefix_groups[:cached_num + 1]) for i in range(batch_num)]
-            # logger.warning(
-            #     f"{pformat(all_prefix)}\n{pformat(prefix_groups[cached_num])}\n{pformat(concat_cached_prefix)}"
-            # )
-            prefix_cache = self.get_cache(prefix_groups[cached_num], prefix_cache, save_last_logits=cached_num == len(transposed_inputs) - 2)
-            # prefix_cache = self.get_cache(prefix_groups[idx])
+            prefix_cache = self.get_cache(
+                prefix_groups[cached_num], prefix_cache, save_last_logits=cached_num == len(prefix_groups) - 1
+            )
 
             for p, c in zip(concat_cached_prefix, prefix_cache):
                 self.cacher.set_cache(p, c, cached_num)
@@ -288,7 +279,6 @@ class HuggingFaceModel(Model):
         ).to(self.device)
 
         with torch.no_grad():
-            # logger.info(f"Getppl {prompt} {batched_encodings.input_ids}")
             logits = self.model(
                 input_ids=batched_encodings["input_ids"], attention_mask=batched_encodings["attention_mask"]
             ).logits
@@ -407,9 +397,43 @@ class HuggingFaceModel(Model):
                 raise ValueError("The candidate_ids must be provided when option_num is None.")
             return self._candidate_ids
 
+    def get_prob_with_cache(
+        self,
+        batched_inputs: List[Tuple[str, int]],
+        batched_option_nums: List[int],
+        prefix_cache: SequenceCache,
+    ) -> List[List[float]]:
+        logits, _, _ = self.get_cache(batched_inputs, prefix_cache, return_caches=False)
+        batch_logits = logits.detach()[:, -1, :]
+
+        answers = []
+        for i, option_num in enumerate(batched_option_nums):
+            label_ids = self._get_label_ids(option_num)
+            answers.append(torch.softmax(batch_logits[i, label_ids], dim=-1, dtype=torch.float32).tolist())
+        return answers
+
     def get_prob(self, batched_inputs: List[Tuple[str, int]]) -> List[List[float]]:
         if not self._prob_args_set:
             logger.warning(f"Please set the get_prob arguments using `set_prob_args` before calling `get_prob`.")
+
+        if self.cacher is not None:
+            *batched_prompts, batched_option_nums = map(list, zip(*batched_inputs))
+            batch_num = len(batched_prompts[0])
+
+            # if cache is available, get_ppl_with_cache
+            all_prefix = ["".join(pg[i] for pg in batched_prompts) for i in range(batch_num)]
+            prefix_cache, cached_num = self.cacher.get_cache(all_prefix)
+            if prefix_cache is not None and cached_num == len(batched_prompts) - 1:
+                # logger.warning(f"get_prob_with_cache, {cached_num} {len(batched_prompts)}")
+                return self.get_prob_with_cache(batched_prompts[-1], batched_option_nums, prefix_cache)
+
+            # pass the input without prefix text to the model
+            concat_cached_prefix = ["".join(pg[i] for pg in batched_prompts[:cached_num + 1]) for i in range(batch_num)]
+            prefix_cache = self.get_cache(batched_prompts[cached_num], prefix_cache, save_last_logits=False)
+
+            for p, c in zip(concat_cached_prefix, prefix_cache):
+                self.cacher.set_cache(p, c, cached_num)
+            return []
 
         batched_prompts, batched_option_nums = map(list, zip(*batched_inputs))
         batched_encodings = self.tokenizer(
@@ -424,7 +448,7 @@ class HuggingFaceModel(Model):
             batch_logits = self.model(
                 input_ids=batched_encodings["input_ids"].to(self.device),
                 attention_mask=batched_encodings["attention_mask"].to(self.device),
-            ).logits.detach()[:, -1].contiguous()  # padding_side="left" in tokenizer
+            ).logits.detach()[:, -1]  # padding_side="left" in tokenizer
 
             answers = []
             for i, option_num in enumerate(batched_option_nums):

@@ -31,6 +31,8 @@ def load_model(args: "ModelArguments") -> "Model":
     else:
         if args.vllm:
             try:
+                import vllm
+
                 from .vllm_model import vllmModel
 
                 return vllmModel(args)
@@ -42,6 +44,11 @@ def load_model(args: "ModelArguments") -> "Model":
                     raise ValueError(f"Set an appropriate tensor parallel size via CUDA_VISIBLE_DEVICES: {e}")
                 else:
                     raise e
+            except ModuleNotFoundError:
+                args.vllm = False
+                logger.warning(
+                    "Please install vllm by `pip install vllm` to use vllm model. Or you can use huggingface model by `--vllm False`."
+                )
         from .huggingface_model import HuggingFaceModel
 
         return HuggingFaceModel(args)

@@ -13,7 +13,11 @@ import torch
 from ..model.huggingface_model import HuggingFaceModel
 from ..utils import dynamic_stride_tqdm
 from ..utils.cache_prefix_sampler import CachePrefixSampler
-from .icl_strategies import (ape, global_entropy_ordering_strategy, knn_construct_examples)
+from .icl_strategies import (
+    ape,
+    global_entropy_ordering_strategy,
+    knn_construct_examples,
+)
 from .utils import get_raw_dataset_loader
 
 if typing.TYPE_CHECKING:
@@ -174,7 +178,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # batch sampler
         if self.model.args.prefix_caching and (
-            self.model_evaluation_method != "get_ppl" or not isinstance(self.model, HuggingFaceModel)
+            self.model_evaluation_method not in {"get_ppl", "get_prob"} or not isinstance(self.model, HuggingFaceModel)
         ):
             logger.warning(
                 "Prefix caching is only available for HuggingFaceModel.get_ppl(). Automatically set prefix_caching to False"
@@ -341,6 +345,7 @@ class Dataset(torch.utils.data.Dataset):
                     contexts = [(context, formatted_instance["target"]) for context in instance_with_examples]
                     self.evaluation_instances.extend(contexts)
                     self.option_nums.append(len(contexts))
+
             logger.info("Evaluation mode: calculate PPL of the optional text based on the source text")
             logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][0]))
             logger.info(f"Formatted example (option)\n" + pformat(self.evaluation_instances[0][1]))
@@ -351,6 +356,7 @@ class Dataset(torch.utils.data.Dataset):
         elif self.model_evaluation_method == "generation":
             for formatted_instance in self.formatted_evaluation_data:
                 self.evaluation_instances.append(self.format_instruction_and_examples(formatted_instance))
+
             logger.info("Evaluation mode: generation based on the source text")
             logger.info("Formatted example (source)\n" + self.evaluation_instances[0])
             if len(self.evaluation_instances) > 1:
@@ -358,9 +364,16 @@ class Dataset(torch.utils.data.Dataset):
 
         elif self.model_evaluation_method == "get_prob":
             for formatted_instance in self.formatted_evaluation_data:
-                self.evaluation_instances.append(self.format_instruction_and_examples(formatted_instance))
-                self.option_nums.append(len(formatted_instance["options"]))
-            self.evaluation_instances = list(zip(self.evaluation_instances, self.option_nums))
+                instance_with_examples = self.format_instruction_and_examples(
+                    formatted_instance, split_prefix=self.model.args.prefix_caching
+                )
+                option_num = len(formatted_instance["options"])
+                self.option_nums.append(option_num)
+                if isinstance(instance_with_examples, str):
+                    self.evaluation_instances.append((instance_with_examples, option_num))
+                else:
+                    self.evaluation_instances.append(tuple(instance_with_examples) + (option_num,))
+
             logger.info("Evaluation mode: get the probability of each option label")
             logger.info("Formatted example (source)\n" + pformat(self.evaluation_instances[0][0]))
             if len(self.evaluation_instances) > 1:
@@ -725,8 +738,14 @@ class Dataset(torch.utils.data.Dataset):
 
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
-            if self.model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size, cache_batch_size=self.args.batch_size // 4)
+            if self.model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
+                cache_prefix_level = -1 if self.model_evaluation_method == "get_prob" else None
+                self._batch_sampler = CachePrefixSampler(
+                    data=self,
+                    batch_size=self.args.batch_size,
+                    cache_batch_size=self.args.batch_size // 4,
+                    cache_prefix_level=cache_prefix_level,
+                )
             else:
                 self._batch_sampler = None
         return self._batch_sampler
@@ -762,9 +781,7 @@ class Dataset(torch.utils.data.Dataset):
                 length *= 2
         return length
 
-    def update_tqdm(
-        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], batch_size: int
-    ):
+    def update_tqdm(self, tqdm: Union[dynamic_stride_tqdm, typing.Any], batch_size: int):
         if isinstance(tqdm, dynamic_stride_tqdm):
             if batch_size == 0:
                 tqdm.hold_tqdm()
@@ -834,8 +851,14 @@ class DatasetCollection(torch.utils.data.Dataset):
 
     def get_batch_sampler(self) -> Optional[CachePrefixSampler]:
         if not hasattr(self, "_batch_sampler"):
-            if self._datasets[0].model.args.prefix_caching:
-                self._batch_sampler = CachePrefixSampler(self, self.args.batch_size, cache_batch_size=self.args.batch_size // 4)
+            if self._datasets[0].model.args.prefix_caching and isinstance(self.model, HuggingFaceModel):
+                cache_prefix_level = -1 if self._datasets[0].model_evaluation_method == "get_prob" else None
+                self._batch_sampler = CachePrefixSampler(
+                    data=self,
+                    batch_size=self.args.batch_size,
+                    cache_batch_size=self.args.batch_size // 4,
+                    cache_prefix_level=cache_prefix_level,
+                )
             else:
                 self._batch_sampler = None
         return self._batch_sampler
@@ -922,9 +945,7 @@ class DatasetCollection(torch.utils.data.Dataset):
 
         return results, score_lists
 
-    def update_tqdm(
-        self, tqdm: Union[dynamic_stride_tqdm, typing.Any], batch_size: int
-    ):
+    def update_tqdm(self, tqdm: Union[dynamic_stride_tqdm, typing.Any], batch_size: int):
         if isinstance(tqdm, dynamic_stride_tqdm):
             if batch_size == 0:
                 tqdm.hold_tqdm()

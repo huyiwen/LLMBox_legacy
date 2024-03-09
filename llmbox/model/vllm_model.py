@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 try:
     from vllm import LLM, SamplingParams
 except ModuleNotFoundError:
-    raise ModuleNotFoundError(
-        "Please install vllm by `pip install vllm` to use vllm model. Or you can use huggingface model by `--vllm False`."
-    )
+    LLM = None
+    EngineArgs = None
+    SamplingParams = None
 
 logger = getLogger(__name__)
 
@@ -44,10 +44,16 @@ class vllmModel(Model):
 
         logger.info(f"Trying to load {args.model_name_or_path} using vllm...")
         self.type = args.model_type
+        llm_kwargs = {}
+        if hasattr(EngineArgs, "enable_prefix_caching"):
+            llm_kwargs["enable_prefix_caching"] = True
+        if hasattr(EngineArgs, "max_logprobs"):
+            llm_kwargs["max_logprobs"] = 20
         self.model = LLM(
             model=args.model_name_or_path,
             tokenizer=args.tokenizer_name_or_path,
-            tensor_parallel_size=torch.cuda.device_count()
+            tensor_parallel_size=torch.cuda.device_count(),
+            **llm_kwargs
         )
         self.tokenizer = self.model.get_tokenizer()
         self.tokenizer.truncation_side = "left"
@@ -121,6 +127,8 @@ class vllmModel(Model):
         return self.word_labels + self.token_labels
 
     def get_prob(self, batched_inputs: List[Tuple[str, int]]) -> List[List[float]]:
+        # from pprint import pprint
+        # pprint(batched_inputs)
         batched_prompts, batched_option_nums = map(list, zip(*batched_inputs))
         if self.candidate_ids is None:
             max_option_num = max(batched_option_nums)
